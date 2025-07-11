@@ -1,22 +1,8 @@
-use dll_syringe::{Syringe, process::OwnedProcess};
-use windows::Win32::System::Diagnostics::Debug::*;
-use windows::Win32::System::WindowsProgramming::*;
-use windows::Win32::System::SystemInformation::*;
-use windows::Win32::System::SystemServices::*;
-use windows::Win32::System::LibraryLoader::*;
-use windows::Win32::System::ProcessStatus::*;
-use windows::Win32::System::Threading::*;
 use eframe::egui::{self, Id, ScrollArea};
-use sysinfo::{System, ProcessesToUpdate};
-use windows::Win32::System::Memory::*;
+use sysinfo::{Pid, ProcessesToUpdate, System};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::*;
-use windows_strings::PCSTR;
-use windows_strings::PSTR;
-use windows::core::BOOL;
 use std::fs::read_dir;
 use tokio::sync::mpsc;
-
 pub mod processes;
 pub mod inject;
 
@@ -26,11 +12,14 @@ pub struct PluginApp {
     pub load_err: Vec<String>,
     pub selected_plugin: Option<String>,
     pub processes: Vec<(String, sysinfo::Pid)>,
+    pub target_pid: Option<Pid>,
     pub system: System,
     pub last_refresh: Instant,
     pub custom_path: String,
     pub tx: mpsc::Sender<String>,
     pub rx: mpsc::Receiver<String>,
+    pub exported_functions: Vec<String>,
+    pub selected_function: Option<String>,
 }
 
 impl PluginApp {
@@ -45,6 +34,7 @@ impl PluginApp {
             .collect::<Vec<_>>();
         processes.sort_by(|(a, _), (b, _)| a.cmp(b));
         let (tx, rx) = mpsc::channel(32);
+
         Self {
             plugin_dir: default_dir.clone(),
             plugins: Vec::new(),
@@ -54,8 +44,11 @@ impl PluginApp {
             system,
             last_refresh: Instant::now(),
             custom_path: default_dir,
+            target_pid: None,
             tx,
             rx,
+            exported_functions: Vec::new(),
+            selected_function: None,
         }
     }
 
@@ -74,31 +67,6 @@ impl PluginApp {
                 .collect();
         }
     }
-
-    fn get_export_rva(data: &[u8], function_name: &str) -> Result<u32, String> {
-        // Similar parsing as get_exports
-        // ...
-        let e_lfanew = // ...
-        // ...
-        let export_rva = // ...
-        // ...
-        let number_of_names = // ...
-        let address_of_names = // ...
-        let address_of_name_ordinals = u32::from_le_bytes([data[export_rva + 36], data[export_rva + 37], data[export_rva + 38], data[export_rva + 39]]) as usize;
-        let address_of_functions = u32::from_le_bytes([data[export_rva + 28], data[export_rva + 29], data[export_rva + 30], data[export_rva + 31]]) as usize;
-        for i in 0..number_of_names {
-            let name_rva = u32::from_le_bytes([data[address_of_names + i*4], // ...
-            let name = // ...
-            if name == function_name {
-                let ordinal = u16::from_le_bytes([data[address_of_name_ordinals + i*2], data[address_of_name_ordinals + i*2 + 1]]) as usize;
-                let rva = u32::from_le_bytes([data[address_of_functions + ordinal*4], // ...
-                return Ok(rva);
-            }
-        }
-        Err("Function not found".to_string())
-    }
-
-
 }
 
 impl eframe::App for PluginApp {
@@ -117,6 +85,7 @@ impl eframe::App for PluginApp {
                         ui.label("Custom Plugin Path:");
                         ui.text_edit_singleline(&mut self.custom_path);
                     });
+
                     if ui.button("Set Path").clicked() {
                         self.plugin_dir = if self.custom_path.is_empty() {
                             "C:\\Users\\shadowbroker\\Desktop\\injector\\target\\release".to_string()
@@ -125,19 +94,24 @@ impl eframe::App for PluginApp {
                         };
                         self.scan_plugins();
                     }
+
                     if ui.button("Scan Plugins").clicked() {
                         self.scan_plugins();
                     }
+
                     ui.label("Available Plugins:");
-                    for plugin in &self.plugins {
+                    let plugs = self.plugins.clone();
+                    for plugin in plugs.iter() {
                         if ui.radio_value(&mut self.selected_plugin, Some(plugin.clone()), plugin).clicked() {
                             self.selected_plugin = Some(plugin.clone());
+                            self.list_exports(); // <-- Parse and list exported functions
                         }
                     }
 
                     if ui.button("Scan Processes").clicked() {
                         self.scan_processes();
                     }
+                    
                     ui.heading("Available Processes:");
 
                 });
@@ -152,6 +126,7 @@ impl eframe::App for PluginApp {
                             let plugs = self.selected_plugin.clone();
                             let tx = self.tx.clone();
                             let plugin_dir = self.plugin_dir.clone();
+                            self.target_pid = Some(*pid);
                             let pid = *pid;
                             if let Some(plugin) = plugs {
                                 tokio::spawn(async move {
@@ -181,16 +156,55 @@ impl eframe::App for PluginApp {
                     }
                 });
                 ui[1].vertical_centered(|ui| {
-                    ui.heading("Messages:");
-                });
-                ScrollArea::vertical()
-                .auto_shrink(false)
-                .id_salt(Id::new("Error messages"))
-                .show(&mut ui[1], |ui| {
-                    for err in self.load_err.iter() {
-                        ui.label(err.clone());
-                        ui.separator();
-                    }
+                    ui.heading("Available Functions");
+                    ui.separator();
+                    ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .max_height(200.)
+                    .id_salt(Id::new("Available Functions List"))
+                    .show(ui, |ui| {
+                        let exported = self.exported_functions.clone();
+                        for export in exported.iter() {
+                            if ui.button(export).clicked() {
+                                if let Some(pid) = self.target_pid {
+                                    let plugin_name = self.selected_plugin.clone().unwrap();
+                                    let path = format!("{}/{}", self.plugin_dir, plugin_name);
+                                    let function = export.clone();
+                                    let tx = self.tx.clone();
+                                    let pid = pid.as_u32();
+                                    // tokio::spawn(async move {
+                                        match unsafe { Self::call_exported_fn(
+                                            plugin_name,
+                                            path,
+                                            function,
+                                            pid,
+                                            tx.clone()
+                                        ) } {
+                                            Ok(_) => {
+                                                let _ = tx.try_send(format!("Called Exported Fn"));
+                                            },
+                                            Err(e) => {
+                                                let _ = tx.try_send(e.to_string());
+                                            },
+                                        }
+                                    // });
+                                }
+                            }
+                        }
+                    });
+
+                    ui.heading("Messages");
+                    ui.separator();
+                    ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .max_height(200.)
+                    .id_salt(Id::new("Error messages"))
+                    .show(ui, |ui| {
+                        for err in self.load_err.iter() {
+                            ui.label(err.clone());
+                            ui.separator();
+                        }
+                    });
                 });
             });
         });
