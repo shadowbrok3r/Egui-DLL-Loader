@@ -1,0 +1,31 @@
+[package]
+name = "egui_dll_load"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[package.metadata.winres]
+ProductName = "egui_dll_load" 
+OriginalFilename = "egui_dll_load.EXE"
+LegalCopyright = "Copyright © 2025"
+ProductVersion = "0.1.0"
+FileDescription = "egui_dll_load"
+
+[dependencies]
+anyhow = "1.0.98"
+dll-syringe = { version = "0.16.0", features = ["full"] }
+eframe = "*"
+libloading = "*"
+sysinfo = "0.36.0"
+tokio = { version = "1.46.1", features = ["full"] }
+windows = {version = "0.61.3", features = [
+    "Win32_System_Threading",
+]}
+windows-strings = "0.4.2"
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+windows_x86_64_msvc = "0.53"
+static_vcruntime = "2"
+embed-resource = "3.0.1"
+winres = "0.1"
+winapi = { version = "0.3", features = ["processthreadsapi"] }
