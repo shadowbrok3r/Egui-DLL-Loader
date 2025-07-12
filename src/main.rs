@@ -1,6 +1,6 @@
-use eframe::egui::{self, vec2, Button, Color32, Id, Layout, RichText, ScrollArea, Widget};
+use eframe::egui::{self, Color32, Id, Layout, Modal, RichText, ScrollArea};
 use sysinfo::{Pid, ProcessesToUpdate, System};
-use std::time::{Duration, Instant};
+use egui_file_dialog::FileDialog;
 use std::fs::read_dir;
 use tokio::sync::mpsc;
 pub mod processes;
@@ -19,6 +19,8 @@ pub struct PluginApp {
     pub exported_functions: Vec<ExportInfo>,
     pub selected_function: Option<String>,
     pub process_to_hollow: String,
+    file_dialog: FileDialog,
+    open_warning_modal: bool
 }
 
 #[derive(Debug, Clone)]
@@ -28,7 +30,6 @@ pub struct ExportInfo {
     pub rva: usize,
     pub offset: usize,
 }
-
 
 impl PluginApp {
     fn new() -> Self {
@@ -70,7 +71,9 @@ impl PluginApp {
             rx,
             exported_functions: Vec::new(),
             selected_function: None,
-            process_to_hollow: String::new()
+            process_to_hollow: String::new(),
+            file_dialog: FileDialog::new(),
+            open_warning_modal: false,
         }
     }
 
@@ -100,7 +103,7 @@ impl eframe::App for PluginApp {
 
         egui::TopBottomPanel::top(Id::new("Top Panel Plugin App")).show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Plugin Path:");
+                ui.label("Plugin Path:             ");
                 ui.text_edit_singleline(&mut self.plugin_dir);
                 
                 ui.add_space(10.);
@@ -119,6 +122,19 @@ impl eframe::App for PluginApp {
             ui.horizontal(|ui| {
                 ui.label("Process to hollow: ");
                 ui.text_edit_singleline(&mut self.process_to_hollow);
+                ui.add_space(10.);
+                if ui.button("...").clicked() {
+                    self.file_dialog.pick_file();
+                }
+                self.file_dialog.update(ctx);
+
+                // Check if the user picked a file.
+                if let Some(path) = self.file_dialog.take_picked() {
+                    self.process_to_hollow = format!("{}", path.to_string_lossy());
+                }
+
+                ui.add_space(27.);
+
                 if ui.button(RichText::new("Hollow Process").color(Color32::LIGHT_RED)).clicked() {
                     if let (Some(function), Some(plugin)) = (&self.selected_function, &self.selected_plugin) {
                         unsafe { 
@@ -127,9 +143,20 @@ impl eframe::App for PluginApp {
                                 let proc_info_res = Self::hollow_process(dummy_process);
                                 match proc_info_res {
                                     Ok(proc_info) => {
+                                        let pid = proc_info.dwProcessId;
+                                        self.target_pid = Some(Pid::from_u32(pid));
+                                        self.load_err.push(format!("Selected PID: {}", proc_info.dwProcessId));
                                         self.load_err.push(format!("Hollowed out process: {dummy_process}: proc_info: {proc_info:#?}"));
                                         match Self::inject_hollowed_process(&std::fs::read(format!("{}/{plugin}", self.plugin_dir)).unwrap_or_default(), proc_info.hProcess, function, proc_info.dwProcessId) {
-                                            Ok(_) => self.load_err.push(format!("Injected {plugin} to PID {}", proc_info.dwProcessId)),
+                                            Ok(_) => {
+                                                self.load_err.push(format!("Injected {plugin} to PID {}", proc_info.dwProcessId));
+                                                let path = format!("{}/{}", self.plugin_dir, plugin);
+                                                let tx = self.tx.clone();
+                                                match Self::call_exported_fn(plugin.clone(), path, function.clone(), pid, tx.clone()) {
+                                                    Ok(_) => { let _ = tx.try_send(format!("Called Exported Fn")); },
+                                                    Err(e) => { let _ = tx.try_send(e.to_string()); },
+                                                }
+                                            },
                                             Err(e) => self.load_err.push(format!("Error injecting {plugin} into PID {}: {e}", proc_info.dwProcessId)),
                                         }
                                     }
@@ -137,10 +164,33 @@ impl eframe::App for PluginApp {
                                 }
                             }
                         };
+                    } else {
+                        if self.selected_function.is_none() || self.selected_plugin.is_none() {
+                            self.open_warning_modal = true;
+                        }
                     }
                 }
             })
         });
+
+        if self.open_warning_modal {
+            let modal = Modal::new(Id::new("Missing selected function modal"))
+            .show(ctx, |ui| {
+                if self.selected_function.is_none() {
+                    ui.label("Missing Selected Function");
+                }
+                if self.selected_plugin.is_none() {
+                    ui.label("Missing Selected Plugin");
+                }
+                if self.target_pid.is_none() {
+                    ui.label("Missing Selected PID");
+                }
+            });
+
+            if modal.should_close() {
+                self.open_warning_modal = false;
+            }
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.columns(2, |ui| {
@@ -182,13 +232,12 @@ impl eframe::App for PluginApp {
                                     // }
                                 });
                             } else {
-                                self.load_err.push("No plugin selected".to_string());
+                                self.open_warning_modal = true;
                             }
                         }
                     }
                 });
                 ui[1].vertical_centered(|ui| {
-
                     ui.heading("Available Plugins");
                     ui.separator();
                     ScrollArea::vertical()
@@ -198,11 +247,13 @@ impl eframe::App for PluginApp {
                     .show(ui, |ui| {
                         let plugs = self.plugins.clone();
                         for plugin in plugs.iter() {
-                            if ui.radio_value(&mut self.selected_plugin, Some(plugin.clone()), plugin).clicked() {
-                                self.load_err.push(format!("Selected Plugin: {plugin}"));
-                                self.selected_plugin = Some(plugin.clone());
-                                self.list_exports(); // <-- Parse and list exported functions
-                            }
+                            ui.horizontal(|ui| {
+                                if ui.radio_value(&mut self.selected_plugin, Some(plugin.clone()), plugin).clicked() {
+                                    self.load_err.push(format!("Selected Plugin: {plugin}"));
+                                    self.selected_plugin = Some(plugin.clone());
+                                    self.list_exports(); // <-- Parse and list exported functions
+                                }
+                            });
                         }
                     });
 
@@ -216,32 +267,35 @@ impl eframe::App for PluginApp {
                         let exported = self.exported_functions.clone();
                         for export in exported.iter() {
                             ui.horizontal(|ui| {
-                                if Button::new(RichText::new(&export.name).color(Color32::LIGHT_RED)).min_size(vec2(100., 10.)).ui(ui).clicked() {
+                                if ui.button(RichText::new("Run").color(Color32::LIGHT_RED)).clicked() {
+                                    if let Some(pid) = self.target_pid {
+                                        let plugin_name = self.selected_plugin.clone().unwrap();
+                                        let path = format!("{}/{}", self.plugin_dir, plugin_name);
+                                        let function = export.name.clone();
+                                        let tx = self.tx.clone();
+                                        let pid = pid.as_u32();
+                                        // tokio::spawn(async move {
+                                            match unsafe { Self::call_exported_fn(
+                                                plugin_name,
+                                                path,
+                                                function,
+                                                pid,
+                                                tx.clone()
+                                            ) } {
+                                                Ok(_) => {
+                                                    let _ = tx.try_send(format!("Called Exported Fn"));
+                                                },
+                                                Err(e) => {
+                                                    let _ = tx.try_send(e.to_string());
+                                                },
+                                            }
+                                        // });
+                                    } else {
+                                        self.open_warning_modal = true;
+                                    }
+                                }
+                                if ui.radio_value(&mut self.selected_function, Some(export.name.clone()), RichText::new(&export.name).color(Color32::LIGHT_GREEN)).clicked() {
                                     self.load_err.push(format!("Selected Function: {}", export.name));
-                                    self.selected_function = Some(export.name.clone());
-                                    // if let Some(pid) = self.target_pid {
-                                    //     let plugin_name = self.selected_plugin.clone().unwrap();
-                                    //     let path = format!("{}/{}", self.plugin_dir, plugin_name);
-                                    //     let function = export.name.clone();
-                                    //     let tx = self.tx.clone();
-                                    //     let pid = pid.as_u32();
-                                    //     // tokio::spawn(async move {
-                                    //         match unsafe { Self::call_exported_fn(
-                                    //             plugin_name,
-                                    //             path,
-                                    //             function,
-                                    //             pid,
-                                    //             tx.clone()
-                                    //         ) } {
-                                    //             Ok(_) => {
-                                    //                 let _ = tx.try_send(format!("Called Exported Fn"));
-                                    //             },
-                                    //             Err(e) => {
-                                    //                 let _ = tx.try_send(e.to_string());
-                                    //             },
-                                    //         }
-                                    //     // });
-                                    // }
                                 }
                                 ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
                                     if export.virtual_address > 0 {
