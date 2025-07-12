@@ -1,15 +1,15 @@
 [package]
-name = "egui_dll_load"
+name = "egui_dll_loader"
 version = "0.1.0"
 edition = "2024"
 build = "build.rs"
 
 [package.metadata.winres]
-ProductName = "egui_dll_load" 
-OriginalFilename = "egui_dll_load.EXE"
+ProductName = "egui_dll_loader" 
+OriginalFilename = "egui_dll_loader.EXE"
 LegalCopyright = "Copyright © 2025"
 ProductVersion = "0.1.0"
-FileDescription = "egui_dll_load"
+FileDescription = "egui_dll_loader"
 
 [dependencies]
 anyhow = "1.0.98"

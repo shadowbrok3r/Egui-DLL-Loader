@@ -887,7 +887,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "egui_dll_load"
+name = "egui_dll_loader"
 version = "0.1.0"
 dependencies = [
  "anyhow",
