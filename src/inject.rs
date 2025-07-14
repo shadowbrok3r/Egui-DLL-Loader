@@ -1,5 +1,4 @@
 use dll_syringe::process::OwnedProcess;
-use dll_syringe::process::ProcessModule;
 use dll_syringe::Syringe;
 use windows::Win32::System::Diagnostics::ToolHelp::*;
 use windows::Win32::System::Diagnostics::Debug::*;
@@ -43,7 +42,7 @@ impl PluginApp {
         dll_data: &[u8],
         process_handle: HANDLE,
         function_name: &str,
-        pid: u32
+        _pid: u32
     ) -> Result<(), String> {
         unsafe {
             // let h_process = OpenProcess(PROCESS_ALL_ACCESS, false, pid.as_u32())
@@ -189,7 +188,7 @@ impl PluginApp {
         Ok(())
     }
 
-    pub async unsafe fn inject_dll_alt(pid: sysinfo::Pid, plugin_dir: String, plugin: String) -> anyhow::Result<(), String> {
+    pub async unsafe fn inject_dll_alt(_pid: sysinfo::Pid, plugin_dir: String, plugin: String) -> anyhow::Result<(), String> {
         unsafe {
             let dll_path = format!("{}/{}", plugin_dir, plugin);
             let dll_data = std::fs::read(&dll_path).map_err(|e| e.to_string())?;

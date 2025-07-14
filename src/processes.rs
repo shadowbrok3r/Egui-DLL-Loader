@@ -174,7 +174,7 @@ impl PluginApp {
     }
 
 
-    fn get_exports(file_path: &str) -> Result<Vec<String>, String> {
+    fn _get_exports(file_path: &str) -> Result<Vec<String>, String> {
         let data = std::fs::read(file_path).map_err(|e| e.to_string())?;
         println!("Data: {}", data.len());
         if data.len() < 64 || u16::from_le_bytes([data[0], data[1]]) != 0x5A4D {
