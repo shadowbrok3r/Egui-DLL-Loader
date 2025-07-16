@@ -1,4 +1,3 @@
-
 # 🧪 Egui DLL Loader (WIP)
 A modern GUI tool built with Rust and [`egui`](https://github.com/emilk/egui) to inject or manually map DLLs into running processes using classic injection or process hollowing techniques.
 
@@ -55,13 +54,16 @@ pub extern "system" fn test_function() {
 
 ```
 egui_dll_loader/
-├── src/
-│   ├── main.rs         # GUI entrypoint
-│   ├── processes.rs    # Hollowing + injection logic
-│   └── pe.rs           # PE parsing (export RVA, sections)
-├── plugins/            # Your DLLs
 ├── Cargo.toml
-└── README.md
+├── dll_loader
+│   ├── build.rs
+│   └── src      
+│       ├── inject.rs      # Hollowing + injection logic
+│       ├── main.rs        # GUI entrypoint
+│       └── processes.rs   # PE parsing (export RVA, sections)
+├── rusty_dll
+│   └── src
+│       └── lib.rs         # Rust DLL to test the loader with
 ```
 
 ## 🧠 Future Ideas
@@ -70,6 +72,3 @@ egui_dll_loader/
 * IAT fixups for full manual mapping
 * Thread hijacking instead of `CreateRemoteThread`
 * Basic AV evasion research modes
-
-
-```
