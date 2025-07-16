@@ -22,6 +22,7 @@ pub struct PluginApp {
     file_dialog: FileDialog,
     open_warning_modal: bool,
     first_run: bool,
+    process_search_string: String,
 }
 
 #[derive(Debug, Clone)]
@@ -34,7 +35,7 @@ pub struct ExportInfo {
 
 impl PluginApp {
     fn new() -> Self {
-        let default_dir = "D:\\Users\\Owner\\Desktop\\rusty-dll\\target\\release".to_string();
+        let default_dir = "C:\\Users\\shadowbroker\\Desktop\\rusty-dll\\target\\release".to_string();
         let mut system = System::new_all();
         system.refresh_processes(ProcessesToUpdate::All, true);
         let mut processes = system
@@ -75,7 +76,8 @@ impl PluginApp {
             process_to_hollow: String::new(),
             file_dialog: FileDialog::new(),
             open_warning_modal: false,
-            first_run: true
+            first_run: true,
+            process_search_string: String::new(),
         }
     }
 
@@ -209,45 +211,57 @@ impl eframe::App for PluginApp {
             ui.columns(2, |ui| {
                 ui[0].vertical_centered(|ui| {
                     ui.heading("Available Processes");
+                    ui.text_edit_singleline(&mut self.process_search_string);
                     ui.separator();
                 });
-                ScrollArea::vertical()
+                ScrollArea::both()
                 .auto_shrink(false)
                 .id_salt(Id::new("Processes"))
                 .show(&mut ui[0], |ui| {
                     let process = self.processes.clone();
-                    for (name, pid) in &process {
-                        if ui.button(format!("PID: {} - {}", pid, name)).clicked() {
-                            let plugs = self.selected_plugin.clone();
-                            let tx = self.tx.clone();
-                            let plugin_dir = self.plugin_dir.clone();
-                            self.target_pid = Some(*pid);
-                            let pid = *pid;
-                            if let (Some(plugin), Some(function)) = (plugs, self.selected_function.clone()) {
-                                tokio::spawn(async move {
-                                    match unsafe { PluginApp::inject_dll(pid, &plugin_dir, &plugin, &function) }.await {
-                                        Ok(()) => {
-                                            tx.send(format!("Injected into PID {}", pid)).await.ok();
-                                        }
-                                        Err(e) => {
-                                            println!("Error: {e:?}");
-                                            tx.send(e).await.ok();
-                                        }
+                    
+                    let search = self.process_search_string.to_lowercase();
+                    for (name, pid) in process
+                        .iter()
+                        .filter(|(name, pid)| name.to_lowercase().contains(&search) || format!("{}", pid.as_u32()).contains(&search)) 
+                    {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(ui.style().visuals.error_fg_color, format!("{}", pid.as_u32()));
+                            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("⮫").clicked() {
+                                    let plugs = self.selected_plugin.clone();
+                                    let tx = self.tx.clone();
+                                    let plugin_dir = self.plugin_dir.clone();
+                                    self.target_pid = Some(*pid);
+                                    let pid = *pid;
+                                    if let (Some(plugin), Some(function)) = (plugs, self.selected_function.clone()) {
+                                        tokio::spawn(async move {
+                                            match unsafe { PluginApp::inject_dll(pid, &plugin_dir, &plugin, &function) }.await {
+                                                Ok(()) => {
+                                                    tx.send(format!("Injected into PID {}", pid)).await.ok();
+                                                }
+                                                Err(e) => {
+                                                    println!("Error: {e:?}");
+                                                    tx.send(e).await.ok();
+                                                }
+                                            }
+                                            // match unsafe { PluginApp::hollow_and_inject(pid, plugin_dir, plugin) }.await {
+                                            //     Ok(()) => {
+                                            //         tx.send(format!("Injected into PID {}", pid)).await.ok();
+                                            //     }
+                                            //     Err(e) => {
+                                            //         println!("Error: {e:?}");
+                                            //         tx.send(e).await.ok();
+                                            //     }
+                                            // }
+                                        });
+                                    } else {
+                                        self.open_warning_modal = true;
                                     }
-                                    // match unsafe { PluginApp::hollow_and_inject(pid, plugin_dir, plugin) }.await {
-                                    //     Ok(()) => {
-                                    //         tx.send(format!("Injected into PID {}", pid)).await.ok();
-                                    //     }
-                                    //     Err(e) => {
-                                    //         println!("Error: {e:?}");
-                                    //         tx.send(e).await.ok();
-                                    //     }
-                                    // }
-                                });
-                            } else {
-                                self.open_warning_modal = true;
-                            }
-                        }
+                                }
+                                ui.label(name);
+                            });
+                        });
                     }
                 });
                 ui[1].vertical_centered(|ui| {
@@ -336,7 +350,7 @@ impl eframe::App for PluginApp {
                     .id_salt(Id::new("Error messages"))
                     .show(ui, |ui| {
                         for err in self.load_err.iter() {
-                            ui.horizontal(|ui| ui.colored_label(Color32::RED, err.clone()));
+                            ui.horizontal(|ui| ui.colored_label(ui.style().visuals.error_fg_color, err.clone()));
                         }
                     });
                 });
@@ -359,7 +373,7 @@ async fn main() -> eframe::Result<()> {
     let app = PluginApp::new();
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
-        "Plugin App",
+        "DLL Injector",
         native_options,
         Box::new(|_| Ok(Box::new(app))),
     )
