@@ -13,7 +13,7 @@ FileDescription = "egui_dll_loader"
 
 [dependencies]
 anyhow = "1.0.98"
-dll-syringe = { version = "0.16.0", features = ["full"] }
+dll-syringe = { version = "0.17.0", features = ["full"] }
 eframe = { version = "0.32.0", features = ["serde"] }
 egui-file-dialog = "0.11.0"
 libloading = "*"

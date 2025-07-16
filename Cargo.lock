@@ -786,11 +786,12 @@ dependencies = [
 
 [[package]]
 name = "dll-syringe"
-version = "0.16.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea9e763602dc67ade757422878f95e6c16801be3c9065349fed45c8b7587d116"
+checksum = "2df4d1b3e551ad7d37ae81db3d70751ac4a64ea91a62442e36312917cd1d0d8a"
 dependencies = [
  "bincode",
+ "dll-syringe-macros",
  "goblin",
  "iced-x86",
  "konst",
@@ -800,10 +801,20 @@ dependencies = [
  "serde",
  "shrinkwraprs",
  "stopwatch2",
- "sysinfo 0.35.2",
+ "sysinfo",
  "thiserror 2.0.12",
  "widestring",
  "winapi",
+]
+
+[[package]]
+name = "dll-syringe-macros"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a52aadbd0973e4db2d0781f869c38794ffa03dde3b46eb2fc302a7e6feb5103"
+dependencies = [
+ "quote",
+ "syn 2.0.104",
 ]
 
 [[package]]
@@ -910,7 +921,7 @@ dependencies = [
  "dunce",
  "egui",
  "serde",
- "sysinfo 0.36.0",
+ "sysinfo",
 ]
 
 [[package]]
@@ -967,7 +978,7 @@ dependencies = [
  "serde",
  "serde_json",
  "static_vcruntime",
- "sysinfo 0.36.0",
+ "sysinfo",
  "tokio",
  "winapi",
  "windows",
@@ -2884,20 +2895,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.104",
-]
-
-[[package]]
-name = "sysinfo"
-version = "0.35.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c3ffa3e4ff2b324a57f7aeb3c349656c7b127c3c189520251a648102a92496e"
-dependencies = [
- "libc",
- "memchr",
- "ntapi",
- "objc2-core-foundation",
- "objc2-io-kit",
- "windows",
 ]
 
 [[package]]
