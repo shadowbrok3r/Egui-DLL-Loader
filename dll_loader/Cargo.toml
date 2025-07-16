@@ -1,0 +1,39 @@
+[package]
+name = "egui_dll_loader"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[package.metadata.winres]
+ProductName = "egui_dll_loader" 
+OriginalFilename = "egui_dll_loader.EXE"
+LegalCopyright = "Copyright © 2025"
+ProductVersion = "0.1.0"
+FileDescription = "egui_dll_loader"
+
+[dependencies]
+libloading = { workspace = true }
+anyhow = "1.0.98"
+dll-syringe = { version = "0.17.0", features = ["full"] }
+eframe = { version = "0.32.0", features = ["serde"] }
+egui-file-dialog = "0.11.0"
+sysinfo = "0.36.0"
+tokio = { version = "1.46.1", features = ["full"] }
+windows = {version = "0.61.3", features = [
+    "Win32_System_Threading",
+]}
+windows-strings = "0.4.2"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+windows_x86_64_msvc = "0.53"
+static_vcruntime = "2"
+winres = "0.1"
+winapi = { workspace = true }
+
+
+[dependencies.egui]
+version = "0.32.0"
+default-features = false
+features = ["rayon", "bytemuck", "log", "serde"]
