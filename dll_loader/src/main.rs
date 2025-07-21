@@ -23,6 +23,17 @@ pub struct PluginApp {
     open_warning_modal: bool,
     first_run: bool,
     process_search_string: String,
+    current_page: InjectionPage,
+    evasion_mode: bool,
+    thread_hijack_mode: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum InjectionPage {
+    ClassicInjection,
+    ProcessHollowing,
+    ReflectiveInjection,
+    ManualMapping,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +89,9 @@ impl PluginApp {
             open_warning_modal: false,
             first_run: true,
             process_search_string: String::new(),
+            current_page: InjectionPage::ClassicInjection,
+            evasion_mode: false,
+            thread_hijack_mode: false,
         }
     }
 
@@ -132,60 +146,142 @@ impl eframe::App for PluginApp {
                 if ui.button("Refresh Processes").clicked() {
                     self.scan_processes();
                 }
+
+                ui.add_space(10.);
+                ui.checkbox(&mut self.evasion_mode, "AV Evasion Mode");
+                ui.checkbox(&mut self.thread_hijack_mode, "Thread Hijacking");
             });
 
+            // Page navigation
             ui.horizontal(|ui| {
-                ui.label("Process to hollow: ");
-                ui.text_edit_singleline(&mut self.process_to_hollow);
-                ui.add_space(10.);
-                if ui.button("...").clicked() {
-                    self.file_dialog.pick_file();
-                }
-                self.file_dialog.update(ctx);
+                ui.selectable_value(&mut self.current_page, InjectionPage::ClassicInjection, "Classic Injection");
+                ui.selectable_value(&mut self.current_page, InjectionPage::ProcessHollowing, "Process Hollowing");
+                ui.selectable_value(&mut self.current_page, InjectionPage::ReflectiveInjection, "Reflective Injection");
+                ui.selectable_value(&mut self.current_page, InjectionPage::ManualMapping, "Manual Mapping");
+            });
+            
+            ui.separator();
 
-                // Check if the user picked a file.
-                if let Some(path) = self.file_dialog.take_picked() {
-                    self.process_to_hollow = format!("{}", path.to_string_lossy());
-                }
+            // Page-specific controls
+            match self.current_page {
+                InjectionPage::ProcessHollowing => {
+                    ui.horizontal(|ui| {
+                        ui.label("Process to hollow: ");
+                        ui.text_edit_singleline(&mut self.process_to_hollow);
+                        ui.add_space(10.);
+                        if ui.button("...").clicked() {
+                            self.file_dialog.pick_file();
+                        }
+                        self.file_dialog.update(ctx);
 
-                ui.add_space(27.);
+                        // Check if the user picked a file.
+                        if let Some(path) = self.file_dialog.take_picked() {
+                            self.process_to_hollow = format!("{}", path.to_string_lossy());
+                        }
 
-                if ui.button(RichText::new("Hollow Process").color(Color32::LIGHT_RED)).clicked() {
-                    if let (Some(function), Some(plugin)) = (&self.selected_function, &self.selected_plugin) {
-                        unsafe { 
-                            let dummy_process = self.process_to_hollow.as_str();
-                            if !dummy_process.is_empty() {
-                                let proc_info_res = Self::hollow_process(dummy_process);
-                                match proc_info_res {
-                                    Ok(proc_info) => {
-                                        let pid = proc_info.dwProcessId;
-                                        self.target_pid = Some(Pid::from_u32(pid));
-                                        self.load_err.push(format!("Selected PID: {}", proc_info.dwProcessId));
-                                        self.load_err.push(format!("Hollowed out process: {dummy_process}: proc_info: {proc_info:#?}"));
-                                        match Self::inject_hollowed_process(&std::fs::read(format!("{}/{plugin}", self.plugin_dir)).unwrap_or_default(), proc_info.hProcess, function, proc_info.dwProcessId) {
-                                            Ok(_) => {
-                                                self.load_err.push(format!("Injected {plugin} to PID {}", proc_info.dwProcessId));
-                                                let path = format!("{}/{}", self.plugin_dir, plugin);
-                                                let tx = self.tx.clone();
-                                                match Self::call_exported_fn(plugin.clone(), path, function.clone(), pid, tx.clone()) {
-                                                    Ok(_) => { let _ = tx.try_send(format!("Called Exported Fn")); },
-                                                    Err(e) => { let _ = tx.try_send(e.to_string()); },
+                        ui.add_space(27.);
+
+                        if ui.button(RichText::new("Hollow Process").color(Color32::LIGHT_RED)).clicked() {
+                            if let (Some(function), Some(plugin)) = (&self.selected_function, &self.selected_plugin) {
+                                unsafe { 
+                                    let dummy_process = self.process_to_hollow.as_str();
+                                    if !dummy_process.is_empty() {
+                                        let proc_info_res = Self::hollow_process(dummy_process);
+                                        match proc_info_res {
+                                            Ok(proc_info) => {
+                                                let pid = proc_info.dwProcessId;
+                                                self.target_pid = Some(Pid::from_u32(pid));
+                                                self.load_err.push(format!("Selected PID: {}", proc_info.dwProcessId));
+                                                self.load_err.push(format!("Hollowed out process: {dummy_process}: proc_info: {proc_info:#?}"));
+                                                match Self::inject_hollowed_process_improved(&std::fs::read(format!("{}/{plugin}", self.plugin_dir)).unwrap_or_default(), proc_info.hProcess, function, proc_info.dwProcessId) {
+                                                    Ok(_) => {
+                                                        self.load_err.push(format!("Injected {plugin} to PID {}", proc_info.dwProcessId));
+                                                        let path = format!("{}/{}", self.plugin_dir, plugin);
+                                                        let tx = self.tx.clone();
+                                                        match Self::call_exported_fn(plugin.clone(), path, function.clone(), pid, tx.clone()) {
+                                                            Ok(_) => { let _ = tx.try_send(format!("Called Exported Fn")); },
+                                                            Err(e) => { let _ = tx.try_send(e.to_string()); },
+                                                        }
+                                                    },
+                                                    Err(e) => self.load_err.push(format!("Error injecting {plugin} into PID {}: {e}", proc_info.dwProcessId)),
                                                 }
-                                            },
-                                            Err(e) => self.load_err.push(format!("Error injecting {plugin} into PID {}: {e}", proc_info.dwProcessId)),
+                                            }
+                                            Err(e) => self.load_err.push(format!("Error Hollowing out {dummy_process}: {e:?}"))
                                         }
                                     }
-                                    Err(e) => self.load_err.push(format!("Error Hollowing out {dummy_process}: {e:?}"))
+                                };
+                            } else {
+                                if self.selected_function.is_none() || self.selected_plugin.is_none() {
+                                    self.open_warning_modal = true;
                                 }
                             }
-                        };
-                    } else {
-                        if self.selected_function.is_none() || self.selected_plugin.is_none() {
-                            self.open_warning_modal = true;
                         }
-                    }
+                    });
                 }
-            })
+                InjectionPage::ReflectiveInjection => {
+                    ui.horizontal(|ui| {
+                        ui.label("Reflective DLL Injection");
+                        ui.add_space(20.);
+                        if ui.button(RichText::new("Inject Reflectively").color(Color32::LIGHT_BLUE)).clicked() {
+                            if let (Some(function), Some(plugin)) = (&self.selected_function, &self.selected_plugin) {
+                                if let Some(pid) = self.target_pid {
+                                    let plugin_dir = self.plugin_dir.clone();
+                                    let tx = self.tx.clone();
+                                    let plugin = plugin.clone();
+                                    let function = function.clone();
+                                    tokio::spawn(async move {
+                                        match unsafe { PluginApp::inject_reflective_dll(pid, &plugin_dir, &plugin, &function) }.await {
+                                            Ok(()) => {
+                                                tx.send(format!("Reflectively injected into PID {}", pid)).await.ok();
+                                            }
+                                            Err(e) => {
+                                                tx.send(e).await.ok();
+                                            }
+                                        }
+                                    });
+                                } else {
+                                    self.open_warning_modal = true;
+                                }
+                            } else {
+                                self.open_warning_modal = true;
+                            }
+                        }
+                    });
+                }
+                InjectionPage::ManualMapping => {
+                    ui.horizontal(|ui| {
+                        ui.label("Manual Mapping with IAT Fixups");
+                        ui.add_space(20.);
+                        if ui.button(RichText::new("Manual Map").color(Color32::LIGHT_GREEN)).clicked() {
+                            if let (Some(function), Some(plugin)) = (&self.selected_function, &self.selected_plugin) {
+                                if let Some(pid) = self.target_pid {
+                                    let plugin_dir = self.plugin_dir.clone();
+                                    let tx = self.tx.clone();
+                                    let plugin = plugin.clone();
+                                    let function = function.clone();
+                                    tokio::spawn(async move {
+                                        match unsafe { PluginApp::inject_manual_map(pid, &plugin_dir, &plugin, &function) }.await {
+                                            Ok(()) => {
+                                                tx.send(format!("Manual mapped into PID {}", pid)).await.ok();
+                                            }
+                                            Err(e) => {
+                                                tx.send(e).await.ok();
+                                            }
+                                        }
+                                    });
+                                } else {
+                                    self.open_warning_modal = true;
+                                }
+                            } else {
+                                self.open_warning_modal = true;
+                            }
+                        }
+                    });
+                }
+                InjectionPage::ClassicInjection => {
+                    // No additional controls needed for classic injection
+                }
+            }
         });
 
         if self.open_warning_modal {
@@ -234,9 +330,29 @@ impl eframe::App for PluginApp {
                                     let plugin_dir = self.plugin_dir.clone();
                                     self.target_pid = Some(*pid);
                                     let pid = *pid;
+                                    let current_page = self.current_page.clone();
+                                    let thread_hijack = self.thread_hijack_mode;
+                                    let evasion_mode = self.evasion_mode;
+                                    
                                     if let (Some(plugin), Some(function)) = (plugs, self.selected_function.clone()) {
                                         tokio::spawn(async move {
-                                            match unsafe { PluginApp::inject_dll(pid, &plugin_dir, &plugin, &function) }.await {
+                                            let result = match current_page {
+                                                InjectionPage::ClassicInjection => {
+                                                    unsafe { PluginApp::inject_dll_with_options(pid, &plugin_dir, &plugin, &function, thread_hijack, evasion_mode) }.await
+                                                }
+                                                InjectionPage::ReflectiveInjection => {
+                                                    unsafe { PluginApp::inject_reflective_dll(pid, &plugin_dir, &plugin, &function) }.await
+                                                }
+                                                InjectionPage::ManualMapping => {
+                                                    unsafe { PluginApp::inject_manual_map(pid, &plugin_dir, &plugin, &function) }.await
+                                                }
+                                                InjectionPage::ProcessHollowing => {
+                                                    // This will be handled by the separate hollow process button
+                                                    Err("Use the Hollow Process button for process hollowing".to_string())
+                                                }
+                                            };
+                                            
+                                            match result {
                                                 Ok(()) => {
                                                     tx.send(format!("Injected into PID {}", pid)).await.ok();
                                                 }
@@ -245,15 +361,6 @@ impl eframe::App for PluginApp {
                                                     tx.send(e).await.ok();
                                                 }
                                             }
-                                            // match unsafe { PluginApp::hollow_and_inject(pid, plugin_dir, plugin) }.await {
-                                            //     Ok(()) => {
-                                            //         tx.send(format!("Injected into PID {}", pid)).await.ok();
-                                            //     }
-                                            //     Err(e) => {
-                                            //         println!("Error: {e:?}");
-                                            //         tx.send(e).await.ok();
-                                            //     }
-                                            // }
                                         });
                                     } else {
                                         self.open_warning_modal = true;
