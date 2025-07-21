@@ -34,6 +34,7 @@ pub enum InjectionPage {
     ProcessHollowing,
     ReflectiveInjection,
     ManualMapping,
+    Help,
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +159,7 @@ impl eframe::App for PluginApp {
                 ui.selectable_value(&mut self.current_page, InjectionPage::ProcessHollowing, "Process Hollowing");
                 ui.selectable_value(&mut self.current_page, InjectionPage::ReflectiveInjection, "Reflective Injection");
                 ui.selectable_value(&mut self.current_page, InjectionPage::ManualMapping, "Manual Mapping");
+                ui.selectable_value(&mut self.current_page, InjectionPage::Help, "Help");
             });
             
             ui.separator();
@@ -281,6 +283,9 @@ impl eframe::App for PluginApp {
                 InjectionPage::ClassicInjection => {
                     // No additional controls needed for classic injection
                 }
+                InjectionPage::Help => {
+                    // Help page content will be displayed in the main central panel
+                }
             }
         });
 
@@ -304,164 +309,294 @@ impl eframe::App for PluginApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.columns(2, |ui| {
-                ui[0].vertical_centered(|ui| {
-                    ui.heading("Available Processes");
-                    ui.text_edit_singleline(&mut self.process_search_string);
-                    ui.separator();
-                });
-                ScrollArea::both()
-                .auto_shrink(false)
-                .id_salt(Id::new("Processes"))
-                .show(&mut ui[0], |ui| {
-                    let process = self.processes.clone();
-                    
-                    let search = self.process_search_string.to_lowercase();
-                    for (name, pid) in process
-                        .iter()
-                        .filter(|(name, pid)| name.to_lowercase().contains(&search) || format!("{}", pid.as_u32()).contains(&search)) 
-                    {
-                        ui.horizontal(|ui| {
-                            ui.colored_label(ui.style().visuals.error_fg_color, format!("{}", pid.as_u32()));
-                            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("⮫").clicked() {
-                                    let plugs = self.selected_plugin.clone();
-                                    let tx = self.tx.clone();
-                                    let plugin_dir = self.plugin_dir.clone();
-                                    self.target_pid = Some(*pid);
-                                    let pid = *pid;
-                                    let current_page = self.current_page.clone();
-                                    let thread_hijack = self.thread_hijack_mode;
-                                    let evasion_mode = self.evasion_mode;
-                                    
-                                    if let (Some(plugin), Some(function)) = (plugs, self.selected_function.clone()) {
-                                        tokio::spawn(async move {
-                                            let result = match current_page {
-                                                InjectionPage::ClassicInjection => {
-                                                    unsafe { PluginApp::inject_dll_with_options(pid, &plugin_dir, &plugin, &function, thread_hijack, evasion_mode) }.await
-                                                }
-                                                InjectionPage::ReflectiveInjection => {
-                                                    unsafe { PluginApp::inject_reflective_dll(pid, &plugin_dir, &plugin, &function) }.await
-                                                }
-                                                InjectionPage::ManualMapping => {
-                                                    unsafe { PluginApp::inject_manual_map(pid, &plugin_dir, &plugin, &function) }.await
-                                                }
-                                                InjectionPage::ProcessHollowing => {
-                                                    // This will be handled by the separate hollow process button
-                                                    Err("Use the Hollow Process button for process hollowing".to_string())
-                                                }
-                                            };
-                                            
-                                            match result {
-                                                Ok(()) => {
-                                                    tx.send(format!("Injected into PID {}", pid)).await.ok();
-                                                }
-                                                Err(e) => {
-                                                    println!("Error: {e:?}");
-                                                    tx.send(e).await.ok();
-                                                }
-                                            }
-                                        });
-                                    } else {
-                                        self.open_warning_modal = true;
-                                    }
-                                }
-                                ui.label(name);
-                            });
-                        });
-                    }
-                });
-                ui[1].vertical_centered(|ui| {
-                    ui.heading("Available Plugins");
-                    ui.separator();
-                    ScrollArea::vertical()
-                    .auto_shrink(true)
-                    .max_height(200.)
-                    .id_salt(Id::new("Available Plugins List"))
+            if self.current_page == InjectionPage::Help {
+                // Help page content
+                ScrollArea::vertical()
+                    .auto_shrink(false)
                     .show(ui, |ui| {
-                        let plugs = self.plugins.clone();
-                        for plugin in plugs.iter() {
-                            ui.horizontal(|ui| {
-                                if ui.radio_value(&mut self.selected_plugin, Some(plugin.clone()), plugin).clicked() {
-                                    self.load_err.push(format!("Selected Plugin: {plugin}"));
-                                    self.selected_plugin = Some(plugin.clone());
-                                    self.list_exports(); // <-- Parse and list exported functions
-                                }
-                            });
-                        }
+                        ui.heading("🛠️ DLL Injection Techniques - Help Guide");
+                        ui.separator();
+                        ui.add_space(10.);
+
+                        // Classic Injection Help
+                        ui.colored_label(Color32::LIGHT_BLUE, "📘 Classic Injection");
+                        ui.label("Traditional DLL injection using CreateRemoteThread or thread hijacking.");
+                        ui.label("• What it does: Loads a DLL into a target process using the Windows loader");
+                        ui.label("• How to use: Select target process → Select DLL → Click arrow button");
+                        ui.label("• When to use: Standard injection, most compatible");
+                        ui.label("• Requirements: Target process must be running, DLL must be on disk");
+                        ui.add_space(10.);
+
+                        // Process Hollowing Help
+                        ui.colored_label(Color32::LIGHT_RED, "🔥 Process Hollowing");
+                        ui.label("Advanced technique that creates a suspended process and replaces its memory.");
+                        ui.label("• What it does: Creates a legitimate process, then replaces its code with your DLL");
+                        ui.label("• How to use: Enter executable path → Select DLL function → Click 'Hollow Process'");
+                        ui.label("• When to use: Stealth injection, bypassing some security measures");
+                        ui.label("• Requirements: Valid executable path, administrative privileges");
+                        ui.label("• Note: Creates a new process, not injecting into existing one");
+                        ui.add_space(10.);
+
+                        // Reflective Injection Help
+                        ui.colored_label(Color32::LIGHT_GREEN, "🌟 Reflective Injection");
+                        ui.label("Memory-only DLL loading without filesystem traces.");
+                        ui.label("• What it does: Manually loads DLL entirely in memory, bypassing Windows loader");
+                        ui.label("• How to use: Select target process → Select DLL → Navigate to Reflective tab → Click 'Inject Reflectively'");
+                        ui.label("• When to use: Avoid disk artifacts, advanced evasion");
+                        ui.label("• Requirements: Target process, properly crafted DLL");
+                        ui.label("• Note: DLL must be compatible with manual loading");
+                        ui.add_space(10.);
+
+                        // Manual Mapping Help
+                        ui.colored_label(Color32::YELLOW, "⚙️ Manual Mapping");
+                        ui.label("Complete PE mapping with comprehensive Import Address Table fixups.");
+                        ui.label("• What it does: Manually maps DLL sections, fixes relocations and imports");
+                        ui.label("• How to use: Select target process → Select DLL → Navigate to Manual Mapping → Click 'Manual Map'");
+                        ui.label("• When to use: Maximum control over injection process, bypass some hooks");
+                        ui.label("• Requirements: Target process, DLL with proper PE structure");
+                        ui.label("• Note: Most complex method, handles dependencies automatically");
+                        ui.add_space(15.);
+
+                        ui.separator();
+                        ui.heading("🔧 Additional Options");
+                        ui.add_space(10.);
+
+                        // AV Evasion Help
+                        ui.colored_label(Color32::GOLD, "🛡️ AV Evasion Mode");
+                        ui.label("Applies basic anti-analysis techniques before injection.");
+                        ui.label("• What it does: Random delays, VM detection, sandbox detection");
+                        ui.label("• When to use: Research environments, evasion testing");
+                        ui.label("• Note: Educational purposes only, may slow down injection");
+                        ui.add_space(10.);
+
+                        // Thread Hijacking Help
+                        ui.colored_label(Color32::LIGHT_GRAY, "🧵 Thread Hijacking");
+                        ui.label("Alternative to CreateRemoteThread using existing thread contexts.");
+                        ui.label("• What it does: Hijacks existing thread, modifies context to load DLL");
+                        ui.label("• When to use: Stealth injection, avoiding CreateRemoteThread detection");
+                        ui.label("• Note: More complex but potentially stealthier");
+                        ui.add_space(15.);
+
+                        ui.separator();
+                        ui.heading("📋 General Usage Instructions");
+                        ui.add_space(10.);
+
+                        ui.label("1. Set Plugin Path: Enter the directory containing your DLL files");
+                        ui.label("2. Scan: Click 'Scan' to load available DLL files");
+                        ui.label("3. Refresh Processes: Click to update the process list");
+                        ui.label("4. Select Target: Choose a target process from the left panel");
+                        ui.label("5. Select DLL: Choose a DLL from the right panel (this loads available functions)");
+                        ui.label("6. Select Function: Choose the exported function to call");
+                        ui.label("7. Choose Method: Select injection technique using the tabs");
+                        ui.label("8. Configure Options: Enable AV Evasion or Thread Hijacking if needed");
+                        ui.label("9. Execute: Use the appropriate button for your chosen method");
+                        ui.add_space(15.);
+
+                        ui.separator();
+                        ui.heading("⚠️ Important Notes");
+                        ui.add_space(10.);
+
+                        ui.colored_label(Color32::RED, "Security Requirements:");
+                        ui.label("• Administrator privileges required for most injection techniques");
+                        ui.label("• Target process must be accessible (same or lower privilege level)");
+                        ui.label("• Some antivirus software may flag this as malicious behavior");
+                        ui.add_space(10.);
+
+                        ui.colored_label(Color32::YELLOW, "Educational Purpose:");
+                        ui.label("• This tool is designed for educational and research purposes only");
+                        ui.label("• Use only on systems you own or have explicit permission to test");
+                        ui.label("• Respect all applicable laws and regulations");
+                        ui.add_space(10.);
+
+                        ui.colored_label(Color32::LIGHT_BLUE, "Troubleshooting:");
+                        ui.label("• If injection fails, check Messages panel for error details");
+                        ui.label("• Ensure DLL is compatible with target process architecture (x64/x86)");
+                        ui.label("• Try different injection methods if one fails");
+                        ui.label("• Verify target process is not protected by security software");
+                        ui.add_space(10.);
+
+                        ui.separator();
+                        ui.heading("🔍 Injection Method Comparison");
+                        ui.add_space(10.);
+
+                        ui.label("Stealth Level (Low to High):");
+                        ui.label("1. Classic Injection (Basic stealth)");
+                        ui.label("2. Manual Mapping (Medium stealth)");
+                        ui.label("3. Reflective Injection (High stealth)");
+                        ui.label("4. Process Hollowing (Highest stealth)");
+                        ui.add_space(10.);
+
+                        ui.label("Complexity Level (Low to High):");
+                        ui.label("1. Classic Injection (Easiest)");
+                        ui.label("2. Process Hollowing (Medium)");
+                        ui.label("3. Reflective Injection (Complex)");
+                        ui.label("4. Manual Mapping (Most Complex)");
+                        ui.add_space(20.);
                     });
-
-                    ui.heading("Available Functions");
-                    ui.separator();
+            } else {
+                // Original layout for other pages
+                ui.columns(2, |ui| {
+                    ui[0].vertical_centered(|ui| {
+                        ui.heading("Available Processes");
+                        ui.text_edit_singleline(&mut self.process_search_string);
+                        ui.separator();
+                    });
                     ScrollArea::both()
-                    .auto_shrink(true)
-                    .max_height(500.)
-                    .id_salt(Id::new("Available Functions List"))
-                    .show(ui, |ui| {
-                        let exported = self.exported_functions.clone();
-                        for export in exported.iter() {
+                    .auto_shrink(false)
+                    .id_salt(Id::new("Processes"))
+                    .show(&mut ui[0], |ui| {
+                        let process = self.processes.clone();
+                        
+                        let search = self.process_search_string.to_lowercase();
+                        for (name, pid) in process
+                            .iter()
+                            .filter(|(name, pid)| name.to_lowercase().contains(&search) || format!("{}", pid.as_u32()).contains(&search)) 
+                        {
                             ui.horizontal(|ui| {
-                                if ui.button(RichText::new("Run").color(Color32::LIGHT_RED)).clicked() {
-                                    if let Some(pid) = self.target_pid {
-                                        let plugin_name = self.selected_plugin.clone().unwrap();
-                                        let path = format!("{}/{}", self.plugin_dir, plugin_name);
-                                        let function = export.name.clone();
-                                        let tx = self.tx.clone();
-                                        let pid = pid.as_u32();
-                                        // tokio::spawn(async move {
-                                            match unsafe { Self::call_exported_fn(
-                                                plugin_name,
-                                                path,
-                                                function,
-                                                pid,
-                                                tx.clone()
-                                            ) } {
-                                                Ok(_) => {
-                                                    let _ = tx.try_send(format!("Called Exported Fn"));
-                                                },
-                                                Err(e) => {
-                                                    let _ = tx.try_send(e.to_string());
-                                                },
-                                            }
-                                        // });
-                                    } else {
-                                        self.open_warning_modal = true;
-                                    }
-                                }
-                                if ui.radio_value(&mut self.selected_function, Some(export.name.clone()), RichText::new(&export.name).color(Color32::LIGHT_GREEN)).clicked() {
-                                    self.load_err.push(format!("Selected Function: {}", export.name));
-                                }
+                                ui.colored_label(ui.style().visuals.error_fg_color, format!("{}", pid.as_u32()));
                                 ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if export.virtual_address > 0 {
-                                        ui.label(format!("{:#X}", export.virtual_address));
-                                        ui.colored_label(Color32::LIGHT_GREEN, "Virtual Addr:");
+                                    if ui.button("⮫").clicked() {
+                                        let plugs = self.selected_plugin.clone();
+                                        let tx = self.tx.clone();
+                                        let plugin_dir = self.plugin_dir.clone();
+                                        self.target_pid = Some(*pid);
+                                        let pid = *pid;
+                                        let current_page = self.current_page.clone();
+                                        let thread_hijack = self.thread_hijack_mode;
+                                        let evasion_mode = self.evasion_mode;
+                                        
+                                        if let (Some(plugin), Some(function)) = (plugs, self.selected_function.clone()) {
+                                            tokio::spawn(async move {
+                                                let result = match current_page {
+                                                    InjectionPage::ClassicInjection => {
+                                                        unsafe { PluginApp::inject_dll_with_options(pid, &plugin_dir, &plugin, &function, thread_hijack, evasion_mode) }.await
+                                                    }
+                                                    InjectionPage::ReflectiveInjection => {
+                                                        unsafe { PluginApp::inject_reflective_dll(pid, &plugin_dir, &plugin, &function) }.await
+                                                    }
+                                                    InjectionPage::ManualMapping => {
+                                                        unsafe { PluginApp::inject_manual_map(pid, &plugin_dir, &plugin, &function) }.await
+                                                    }
+                                                    InjectionPage::ProcessHollowing => {
+                                                        // This will be handled by the separate hollow process button
+                                                        Err("Use the Hollow Process button for process hollowing".to_string())
+                                                    }
+                                                    InjectionPage::Help => {
+                                                        Err("Help page - no injection available".to_string())
+                                                    }
+                                                };
+                                                
+                                                match result {
+                                                    Ok(()) => {
+                                                        tx.send(format!("Injected into PID {}", pid)).await.ok();
+                                                    }
+                                                    Err(e) => {
+                                                        println!("Error: {e:?}");
+                                                        tx.send(e).await.ok();
+                                                    }
+                                                }
+                                            });
+                                        } else {
+                                            self.open_warning_modal = true;
+                                        }
                                     }
-                                    
-                                    ui.label(format!("{:#X}", export.offset));
-                                    ui.colored_label(Color32::LIGHT_BLUE, "Offset:");
-
-                                    ui.label(format!("{:#X}", export.rva));
-                                    ui.colored_label(Color32::from_rgb(155, 10, 155), "RVA:");
+                                    ui.label(name);
                                 });
                             });
                         }
                     });
+                    ui[1].vertical_centered(|ui| {
+                        ui.heading("Available Plugins");
+                        ui.separator();
+                        ScrollArea::vertical()
+                        .auto_shrink(true)
+                        .max_height(200.)
+                        .id_salt(Id::new("Available Plugins List"))
+                        .show(ui, |ui| {
+                            let plugs = self.plugins.clone();
+                            for plugin in plugs.iter() {
+                                ui.horizontal(|ui| {
+                                    if ui.radio_value(&mut self.selected_plugin, Some(plugin.clone()), plugin).clicked() {
+                                        self.load_err.push(format!("Selected Plugin: {plugin}"));
+                                        self.selected_plugin = Some(plugin.clone());
+                                        self.list_exports(); // <-- Parse and list exported functions
+                                    }
+                                });
+                            }
+                        });
 
-                    ui.add_space(50.);
+                        ui.heading("Available Functions");
+                        ui.separator();
+                        ScrollArea::both()
+                        .auto_shrink(true)
+                        .max_height(500.)
+                        .id_salt(Id::new("Available Functions List"))
+                        .show(ui, |ui| {
+                            let exported = self.exported_functions.clone();
+                            for export in exported.iter() {
+                                ui.horizontal(|ui| {
+                                    if ui.button(RichText::new("Run").color(Color32::LIGHT_RED)).clicked() {
+                                        if let Some(pid) = self.target_pid {
+                                            let plugin_name = self.selected_plugin.clone().unwrap();
+                                            let path = format!("{}/{}", self.plugin_dir, plugin_name);
+                                            let function = export.name.clone();
+                                            let tx = self.tx.clone();
+                                            let pid = pid.as_u32();
+                                            // tokio::spawn(async move {
+                                                match unsafe { Self::call_exported_fn(
+                                                    plugin_name,
+                                                    path,
+                                                    function,
+                                                    pid,
+                                                    tx.clone()
+                                                ) } {
+                                                    Ok(_) => {
+                                                        let _ = tx.try_send(format!("Called Exported Fn"));
+                                                    },
+                                                    Err(e) => {
+                                                        let _ = tx.try_send(e.to_string());
+                                                    },
+                                                }
+                                            // });
+                                        } else {
+                                            self.open_warning_modal = true;
+                                        }
+                                    }
+                                    if ui.radio_value(&mut self.selected_function, Some(export.name.clone()), RichText::new(&export.name).color(Color32::LIGHT_GREEN)).clicked() {
+                                        self.load_err.push(format!("Selected Function: {}", export.name));
+                                    }
+                                    ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if export.virtual_address > 0 {
+                                            ui.label(format!("{:#X}", export.virtual_address));
+                                            ui.colored_label(Color32::LIGHT_GREEN, "Virtual Addr:");
+                                        }
+                                        
+                                        ui.label(format!("{:#X}", export.offset));
+                                        ui.colored_label(Color32::LIGHT_BLUE, "Offset:");
 
-                    ui.heading("Messages");
-                    ui.separator();
-                    ScrollArea::vertical()
-                    .auto_shrink(false)
-                    .max_height(200.)
-                    .id_salt(Id::new("Error messages"))
-                    .show(ui, |ui| {
-                        for err in self.load_err.iter() {
-                            ui.horizontal(|ui| ui.colored_label(ui.style().visuals.error_fg_color, err.clone()));
-                        }
+                                        ui.label(format!("{:#X}", export.rva));
+                                        ui.colored_label(Color32::from_rgb(155, 10, 155), "RVA:");
+                                    });
+                                });
+                            }
+                        });
+
+                        ui.add_space(50.);
+
+                        ui.heading("Messages");
+                        ui.separator();
+                        ScrollArea::vertical()
+                        .auto_shrink(false)
+                        .max_height(200.)
+                        .id_salt(Id::new("Error messages"))
+                        .show(ui, |ui| {
+                            for err in self.load_err.iter() {
+                                ui.horizontal(|ui| ui.colored_label(ui.style().visuals.error_fg_color, err.clone()));
+                            }
+                        });
                     });
                 });
-            });
+            }
         });
     }
 }

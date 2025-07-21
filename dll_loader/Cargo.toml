@@ -25,8 +25,7 @@ windows = {version = "0.61.3", features = [
     "Win32_System_Diagnostics_Debug", 
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
-    "Win32_Foundation",
-    "Win32_System_ProcessSnapshot"
+    "Win32_Foundation"
 ]}
 windows-strings = "0.4.2"
 serde_json = "1"
