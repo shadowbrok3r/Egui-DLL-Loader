@@ -80,7 +80,7 @@ impl PluginApp {
         Ok(exports)
     }
 
-    fn rva_to_offset(data: &[u8], rva: usize) -> anyhow::Result<usize> {
+    pub fn rva_to_offset(data: &[u8], rva: usize) -> anyhow::Result<usize> {
         let e_lfanew = u32::from_le_bytes(data[0x3C..0x40].try_into()?) as usize;
         let number_of_sections = u16::from_le_bytes(data[e_lfanew + 6..e_lfanew + 8].try_into()?) as usize;
         let optional_header_size = u16::from_le_bytes(data[e_lfanew + 20..e_lfanew + 22].try_into()?) as usize;
