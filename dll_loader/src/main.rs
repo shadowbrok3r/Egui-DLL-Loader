@@ -190,7 +190,7 @@ impl eframe::App for PluginApp {
                                 unsafe { 
                                     let dummy_process = self.process_to_hollow.as_str();
                                     if !dummy_process.is_empty() {
-                                        let proc_info_res = Self::hollow_process(dummy_process);
+                                        let proc_info_res = Self::get_process_info(dummy_process);
                                         match proc_info_res {
                                             Ok(proc_info) => {
                                                 let pid = proc_info.dwProcessId;
