@@ -47,7 +47,7 @@ pub struct ExportInfo {
 
 impl PluginApp {
     fn new() -> Self {
-        let default_dir = "C:\\Users\\shadowbroker\\Desktop\\rusty-dll\\target\\release".to_string();
+        let default_dir = "C:\\Users\\shadowbroker\\Desktop\\egui_dll_loader\\target\\release".to_string();
         let mut system = System::new_all();
         system.refresh_processes(ProcessesToUpdate::All, true);
         let mut processes = system
