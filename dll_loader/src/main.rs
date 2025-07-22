@@ -187,27 +187,79 @@ impl eframe::App for PluginApp {
 
                         if ui.button(RichText::new("Hollow Process").color(Color32::LIGHT_RED)).clicked() {
                             if let (Some(function), Some(plugin)) = (&self.selected_function, &self.selected_plugin) {
-                                unsafe { 
-                                    let dummy_process = self.process_to_hollow.as_str();
-                                    if !dummy_process.is_empty() {
-                                        let proc_info_res = Self::get_process_info(dummy_process);
-                                        match proc_info_res {
+                                let exe_path = self.process_to_hollow.clone();
+                                let plugin_dir = self.plugin_dir.clone();
+                                let function = function.clone();
+                                let plugin = plugin.clone();
+                                let tx = self.tx.clone();
+                                if !exe_path.is_empty() {
+                                    // Spawn a blocking task for process hollowing and export call
+                                    tokio::spawn(async move {
+                                        use std::fs;
+                                        // 1. Create suspended process
+                                        let process_info = unsafe { PluginApp::get_process_info(&exe_path) };
+                                        match process_info {
                                             Ok(proc_info) => {
-                                                let pid = proc_info.dwProcessId;
-                                                self.target_pid = Some(Pid::from_u32(pid));
-                                                self.load_err.push(format!("Selected PID: {}", proc_info.dwProcessId));
-                                                self.load_err.push(format!("Hollowed out process: {dummy_process}: proc_info: {proc_info:#?}"));
-                                                match Self::inject_hollowed_process_improved(&std::fs::read(format!("{}/{plugin}", self.plugin_dir)).unwrap_or_default(), proc_info.hProcess, function, proc_info.dwProcessId) {
-                                                    Ok(_) => {
-                                                        self.load_err.push(format!("Successfully hollowed process and executed {function} in PID {}", proc_info.dwProcessId));
+                                                // 2. Read DLL data
+                                                let dll_path = format!("{}\\{}", plugin_dir, plugin);
+                                                let dll_data = match fs::read(&dll_path) {
+                                                    Ok(d) => d,
+                                                    Err(e) => {
+                                                        let _ = tx.send(format!("Failed to read DLL: {e}")).await;
+                                                        return;
+                                                    }
+                                                };
+                                                // 3. Inject DLL into hollowed process
+                                                let inject_result = unsafe {
+                                                    PluginApp::inject_hollowed_process_improved(
+                                                        &dll_data,
+                                                        proc_info.hProcess,
+                                                        &function,
+                                                        0,
+                                                    )
+                                                };
+                                                match inject_result {
+                                                    Ok(()) => {
+                                                        // 4. Resume process (if needed)
+                                                        let _ = unsafe { windows::Win32::System::Threading::ResumeThread(proc_info.hThread) };
+                                                        // 5. Now allow calling any export
+                                                        //    (for demo, call the same export again)
+                                                        let (preferred_base, _entry_rva, _size_of_image) = match PluginApp::parse_pe_headers(&dll_data) {
+                                                            Ok(t) => t,
+                                                            Err(e) => {
+                                                                let _ = tx.send(format!("Failed to parse PE headers: {e}")).await;
+                                                                return;
+                                                            }
+                                                        };
+                                                        // Call the export again (user can change this logic as needed)
+                                                        let call_result = unsafe {
+                                                            PluginApp::call_export_in_hollowed_process(
+                                                                proc_info.hProcess,
+                                                                &dll_data,
+                                                                preferred_base,
+                                                                &function,
+                                                            )
+                                                        };
+                                                        match call_result {
+                                                            Ok(()) => {
+                                                                let _ = tx.send(format!("Successfully called export '{function}' in hollowed process")).await;
+                                                            },
+                                                            Err(e) => {
+                                                                let _ = tx.send(format!("Failed to call export: {e}")).await;
+                                                            }
+                                                        }
                                                     },
-                                                    Err(e) => self.load_err.push(format!("Error in process hollowing for PID {}: {e}", proc_info.dwProcessId)),
+                                                    Err(e) => {
+                                                        let _ = tx.send(format!("Process hollowing failed: {e}")).await;
+                                                    }
                                                 }
+                                            },
+                                            Err(e) => {
+                                                let _ = tx.send(format!("Failed to create suspended process: {e}")).await;
                                             }
-                                            Err(e) => self.load_err.push(format!("Error Hollowing out {dummy_process}: {e:?}"))
                                         }
-                                    }
-                                };
+                                    });
+                                }
                             } else {
                                 if self.selected_function.is_none() || self.selected_plugin.is_none() {
                                     self.open_warning_modal = true;

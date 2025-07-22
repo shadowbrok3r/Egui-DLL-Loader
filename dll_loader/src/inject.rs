@@ -747,7 +747,7 @@ impl PluginApp {
         }
     }
 
-    fn parse_pe_headers(dll_data: &[u8]) -> Result<(usize, u32, usize), String> {
+    pub fn parse_pe_headers(dll_data: &[u8]) -> Result<(usize, u32, usize), String> {
         if dll_data.len() < 64 || &dll_data[0..2] != b"MZ" {
             return Err("Invalid DOS header".to_string());
         }
