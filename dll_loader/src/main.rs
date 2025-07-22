@@ -149,8 +149,10 @@ impl eframe::App for PluginApp {
                 }
 
                 ui.add_space(10.);
-                ui.checkbox(&mut self.evasion_mode, "AV Evasion Mode");
-                ui.checkbox(&mut self.thread_hijack_mode, "Thread Hijacking");
+                
+                ui.label("⚠️ For basic injection, leave both options below unchecked");
+                ui.checkbox(&mut self.evasion_mode, "AV Evasion Mode (may interfere with injection)");
+                ui.checkbox(&mut self.thread_hijack_mode, "Thread Hijacking (alternative to CreateRemoteThread)");
             });
 
             // Page navigation
@@ -198,7 +200,7 @@ impl eframe::App for PluginApp {
                                                 match Self::inject_hollowed_process_improved(&std::fs::read(format!("{}/{plugin}", self.plugin_dir)).unwrap_or_default(), proc_info.hProcess, function, proc_info.dwProcessId) {
                                                     Ok(_) => {
                                                         self.load_err.push(format!("Injected {plugin} to PID {}", proc_info.dwProcessId));
-                                                        let path = format!("{}/{}", self.plugin_dir, plugin);
+                                                        let path = format!("{}\\{}", self.plugin_dir, plugin);
                                                         let tx = self.tx.clone();
                                                         match Self::call_exported_fn(plugin.clone(), path, function.clone(), pid, tx.clone()) {
                                                             Ok(_) => { let _ = tx.try_send(format!("Called Exported Fn")); },
@@ -538,7 +540,7 @@ impl eframe::App for PluginApp {
                                     if ui.button(RichText::new("Run").color(Color32::LIGHT_RED)).clicked() {
                                         if let Some(pid) = self.target_pid {
                                             let plugin_name = self.selected_plugin.clone().unwrap();
-                                            let path = format!("{}/{}", self.plugin_dir, plugin_name);
+                                            let path = format!("{}\\{}", self.plugin_dir, plugin_name);
                                             let function = export.name.clone();
                                             let tx = self.tx.clone();
                                             let pid = pid.as_u32();

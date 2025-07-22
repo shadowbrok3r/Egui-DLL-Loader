@@ -128,7 +128,7 @@ impl PluginApp {
             Self::apply_basic_evasion().await?;
         }
 
-        let path = format!("{}/{}", plugin_dir, plugin);
+        let path = format!("{}\\{}", plugin_dir, plugin);
         println!("Injecting DLL: {} into PID: {}", path, pid);
         
         if use_thread_hijacking {
@@ -236,7 +236,7 @@ impl PluginApp {
         function: &str
     ) -> Result<(), String> {
         unsafe {
-            let dll_path = format!("{}/{}", plugin_dir, plugin);
+            let dll_path = format!("{}\\{}", plugin_dir, plugin);
             let dll_data = std::fs::read(&dll_path).map_err(|e| e.to_string())?;
 
             let h_process = OpenProcess(PROCESS_ALL_ACCESS, FALSE.into(), pid.as_u32())
@@ -319,7 +319,7 @@ impl PluginApp {
         function: &str
     ) -> Result<(), String> {
         unsafe {
-            let dll_path = format!("{}/{}", plugin_dir, plugin);
+            let dll_path = format!("{}\\{}", plugin_dir, plugin);
             let dll_data = std::fs::read(&dll_path).map_err(|e| e.to_string())?;
 
             let h_process = OpenProcess(PROCESS_ALL_ACCESS, FALSE.into(), pid.as_u32())
@@ -392,13 +392,13 @@ impl PluginApp {
     // Basic AV evasion techniques
     pub async unsafe fn apply_basic_evasion() -> Result<(), String> {
         // Random delays
-        let delay = rand::random::<u64>() % 1000 + 500;
+        let delay = rand::random::<u64>() % 500 + 100;
         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
 
-        // Check for common analysis tools/VMs
-        if Self::detect_analysis_environment() {
-            return Err("Analysis environment detected".to_string());
-        }
+        // Optional: Check for analysis environments (disabled by default for user-friendliness)
+        // if Self::detect_analysis_environment() {
+        //     return Err("Analysis environment detected".to_string());
+        // }
 
         Ok(())
     }
@@ -605,7 +605,8 @@ impl PluginApp {
     }
 
     pub async unsafe fn inject_dll(pid: sysinfo::Pid, plugin_dir: &str, plugin: &str, function: &str) -> Result<(), String> {
-        let path = format!("{}/{}", plugin_dir, plugin);
+        let path = format!("{}\\{}", plugin_dir, plugin);
+        println!("Injecting DLL: {} into PID: {}", path, pid);
         println!("Injecting DLL: {} into PID: {}", path, pid);
         let process = OwnedProcess::from_pid(pid.as_u32()).map_err(|e| e.to_string())?;
         let syringe = Syringe::for_process(process);
