@@ -146,12 +146,12 @@ impl PluginApp {
     ) -> Result<(), String> {
         unsafe {
             let h_process = OpenProcess(PROCESS_ALL_ACCESS, FALSE.into(), pid.as_u32())
-                .map_err(|e| format!("OpenProcess failed: {}", e))?;
+                .map_err(|e| format!("OpenProcess failed for PID {} (access denied - try running as administrator): {}", pid.as_u32(), e))?;
 
             // Find a suitable thread to hijack
             let thread_id = Self::find_hijackable_thread(pid.as_u32())?;
             let h_thread = OpenThread(THREAD_ALL_ACCESS, FALSE.into(), thread_id)
-                .map_err(|e| format!("OpenThread failed: {}", e))?;
+                .map_err(|e| format!("OpenThread failed for thread {}: {}", thread_id, e))?;
 
             // Suspend the thread
             SuspendThread(h_thread);
@@ -162,7 +162,10 @@ impl PluginApp {
                 ..Default::default() 
             };
             GetThreadContext(h_thread, &mut context)
-                .map_err(|e| format!("GetThreadContext failed: {}", e))?;
+                .map_err(|e| {
+                    ResumeThread(h_thread);
+                    format!("GetThreadContext failed: {}", e)
+                })?;
 
             // Allocate memory for DLL path
             let dll_path_bytes = dll_path.as_bytes();
@@ -176,7 +179,9 @@ impl PluginApp {
 
             if path_alloc.is_null() {
                 ResumeThread(h_thread);
-                return Err("VirtualAllocEx for DLL path failed".to_string());
+                CloseHandle(h_thread).ok();
+                CloseHandle(h_process).ok();
+                return Err("VirtualAllocEx for DLL path failed - insufficient privileges".to_string());
             }
 
             // Write DLL path
@@ -188,14 +193,29 @@ impl PluginApp {
                 None,
             ).map_err(|e| {
                 ResumeThread(h_thread);
+                VirtualFreeEx(h_process, path_alloc, 0, MEM_RELEASE);
+                CloseHandle(h_thread).ok();
+                CloseHandle(h_process).ok();
                 format!("WriteProcessMemory failed: {}", e)
             })?;
 
             // Get LoadLibraryA address
             let kernel32 = GetModuleHandleA(PCSTR(b"kernel32.dll\0".as_ptr()))
-                .map_err(|e| format!("GetModuleHandleA failed: {}", e))?;
+                .map_err(|e| {
+                    ResumeThread(h_thread);
+                    VirtualFreeEx(h_process, path_alloc, 0, MEM_RELEASE);
+                    CloseHandle(h_thread).ok();
+                    CloseHandle(h_process).ok();
+                    format!("GetModuleHandleA failed: {}", e)
+                })?;
             let load_library_addr = GetProcAddress(kernel32, PCSTR(b"LoadLibraryA\0".as_ptr()))
-                .ok_or("LoadLibraryA not found")?;
+                .ok_or_else(|| {
+                    ResumeThread(h_thread);
+                    VirtualFreeEx(h_process, path_alloc, 0, MEM_RELEASE);
+                    CloseHandle(h_thread).ok();
+                    CloseHandle(h_process).ok();
+                    "LoadLibraryA not found".to_string()
+                })?;
 
             // Save original RIP and set new one
             let original_rip = context.Rip;
@@ -204,7 +224,13 @@ impl PluginApp {
 
             // Set the modified context
             SetThreadContext(h_thread, &context)
-                .map_err(|e| format!("SetThreadContext failed: {}", e))?;
+                .map_err(|e| {
+                    ResumeThread(h_thread);
+                    VirtualFreeEx(h_process, path_alloc, 0, MEM_RELEASE);
+                    CloseHandle(h_thread).ok();
+                    CloseHandle(h_process).ok();
+                    format!("SetThreadContext failed: {}", e)
+                })?;
 
             // Resume thread to execute LoadLibraryA
             ResumeThread(h_thread);
@@ -224,6 +250,7 @@ impl PluginApp {
             CloseHandle(h_thread).ok();
             CloseHandle(h_process).ok();
 
+            println!("Thread hijacking injection completed for PID {}", pid.as_u32());
             Ok(())
         }
     }
@@ -237,10 +264,10 @@ impl PluginApp {
     ) -> Result<(), String> {
         unsafe {
             let dll_path = format!("{}\\{}", plugin_dir, plugin);
-            let dll_data = std::fs::read(&dll_path).map_err(|e| e.to_string())?;
+            let dll_data = std::fs::read(&dll_path).map_err(|e| format!("Failed to read DLL file {}: {}", dll_path, e))?;
 
             let h_process = OpenProcess(PROCESS_ALL_ACCESS, FALSE.into(), pid.as_u32())
-                .map_err(|e| format!("OpenProcess failed: {}", e))?;
+                .map_err(|e| format!("OpenProcess failed for PID {} (access denied - try running as administrator): {}", pid.as_u32(), e))?;
 
             // Parse PE and get required info
             let (preferred_base, _entry_rva, size_of_image) = Self::parse_pe_headers(&dll_data)?;
@@ -255,21 +282,34 @@ impl PluginApp {
             );
 
             if alloc.is_null() {
-                return Err("VirtualAllocEx failed for reflective injection".to_string());
+                CloseHandle(h_process).ok();
+                return Err(format!("VirtualAllocEx failed for reflective injection in PID {} - insufficient privileges or protected process", pid.as_u32()));
             }
 
             let actual_base = alloc as usize;
 
             // Map PE sections
-            Self::map_pe_sections(&dll_data, h_process, alloc)?;
+            if let Err(e) = Self::map_pe_sections(&dll_data, h_process, alloc) {
+                VirtualFreeEx(h_process, alloc, 0, MEM_RELEASE);
+                CloseHandle(h_process).ok();
+                return Err(format!("Failed to map PE sections: {}", e));
+            }
 
             // Apply relocations
             if actual_base != preferred_base {
-                Self::apply_relocations(&dll_data, h_process, alloc, preferred_base, actual_base)?;
+                if let Err(e) = Self::apply_relocations(&dll_data, h_process, alloc, preferred_base, actual_base) {
+                    VirtualFreeEx(h_process, alloc, 0, MEM_RELEASE);
+                    CloseHandle(h_process).ok();
+                    return Err(format!("Failed to apply relocations: {}", e));
+                }
             }
 
             // Resolve imports
-            Self::resolve_imports(&dll_data, h_process, alloc)?;
+            if let Err(e) = Self::resolve_imports(&dll_data, h_process, alloc) {
+                VirtualFreeEx(h_process, alloc, 0, MEM_RELEASE);
+                CloseHandle(h_process).ok();
+                return Err(format!("Failed to resolve imports: {}", e));
+            }
 
             // Call DllMain manually if needed
             let dll_main_rva = Self::get_dll_main_rva(&dll_data)?;
@@ -283,7 +323,7 @@ impl PluginApp {
                     Some(1 as *mut _), // DLL_PROCESS_ATTACH
                     0,
                     None,
-                ).map_err(|e| e.to_string())?;
+                ).map_err(|e| format!("Failed to call DllMain: {}", e))?;
 
                 WaitForSingleObject(thread_handle, INFINITE);
                 CloseHandle(thread_handle).ok();
@@ -301,7 +341,7 @@ impl PluginApp {
                 None,
                 0,
                 None,
-            ).map_err(|e| e.to_string())?;
+            ).map_err(|e| format!("Failed to create remote thread for function {}: {}", function, e))?;
 
             WaitForSingleObject(thread_handle, INFINITE);
             CloseHandle(thread_handle).ok();
@@ -320,10 +360,10 @@ impl PluginApp {
     ) -> Result<(), String> {
         unsafe {
             let dll_path = format!("{}\\{}", plugin_dir, plugin);
-            let dll_data = std::fs::read(&dll_path).map_err(|e| e.to_string())?;
+            let dll_data = std::fs::read(&dll_path).map_err(|e| format!("Failed to read DLL file {}: {}", dll_path, e))?;
 
             let h_process = OpenProcess(PROCESS_ALL_ACCESS, FALSE.into(), pid.as_u32())
-                .map_err(|e| format!("OpenProcess failed: {}", e))?;
+                .map_err(|e| format!("OpenProcess failed for PID {} (access denied - try running as administrator): {}", pid.as_u32(), e))?;
 
             // Parse PE headers
             let (preferred_base, _entry_rva, size_of_image) = Self::parse_pe_headers(&dll_data)?;
@@ -347,25 +387,42 @@ impl PluginApp {
                     PAGE_EXECUTE_READWRITE,
                 );
                 if alloc.is_null() {
-                    return Err("VirtualAllocEx failed for manual mapping".to_string());
+                    CloseHandle(h_process).ok();
+                    return Err(format!("VirtualAllocEx failed for manual mapping in PID {} - insufficient privileges or protected process", pid.as_u32()));
                 }
             }
 
             let actual_base = alloc as usize;
 
             // Map all PE sections with proper alignment
-            Self::map_pe_sections_aligned(&dll_data, h_process, alloc)?;
+            if let Err(e) = Self::map_pe_sections_aligned(&dll_data, h_process, alloc) {
+                VirtualFreeEx(h_process, alloc, 0, MEM_RELEASE);
+                CloseHandle(h_process).ok();
+                return Err(format!("Failed to map PE sections: {}", e));
+            }
 
             // Apply relocations if needed
             if actual_base != preferred_base {
-                Self::apply_relocations(&dll_data, h_process, alloc, preferred_base, actual_base)?;
+                if let Err(e) = Self::apply_relocations(&dll_data, h_process, alloc, preferred_base, actual_base) {
+                    VirtualFreeEx(h_process, alloc, 0, MEM_RELEASE);
+                    CloseHandle(h_process).ok();
+                    return Err(format!("Failed to apply relocations: {}", e));
+                }
             }
 
             // Comprehensive IAT resolution
-            Self::resolve_imports_comprehensive(&dll_data, h_process, alloc)?;
+            if let Err(e) = Self::resolve_imports_comprehensive(&dll_data, h_process, alloc) {
+                VirtualFreeEx(h_process, alloc, 0, MEM_RELEASE);
+                CloseHandle(h_process).ok();
+                return Err(format!("Failed to resolve imports: {}", e));
+            }
 
             // Set proper memory protections
-            Self::set_section_protections(&dll_data, h_process, alloc)?;
+            if let Err(e) = Self::set_section_protections(&dll_data, h_process, alloc) {
+                VirtualFreeEx(h_process, alloc, 0, MEM_RELEASE);
+                CloseHandle(h_process).ok();
+                return Err(format!("Failed to set section protections: {}", e));
+            }
 
             // Call the target function
             let function_rva = Self::get_export_rva(&dll_data, function)?;
@@ -379,7 +436,7 @@ impl PluginApp {
                 None,
                 0,
                 None,
-            ).map_err(|e| e.to_string())?;
+            ).map_err(|e| format!("Failed to create remote thread for function {}: {}", function, e))?;
 
             WaitForSingleObject(thread_handle, INFINITE);
             CloseHandle(thread_handle).ok();
@@ -607,18 +664,19 @@ impl PluginApp {
     pub async unsafe fn inject_dll(pid: sysinfo::Pid, plugin_dir: &str, plugin: &str, function: &str) -> Result<(), String> {
         let path = format!("{}\\{}", plugin_dir, plugin);
         println!("Injecting DLL: {} into PID: {}", path, pid);
-        println!("Injecting DLL: {} into PID: {}", path, pid);
-        let process = OwnedProcess::from_pid(pid.as_u32()).map_err(|e| e.to_string())?;
+        
+        let process = OwnedProcess::from_pid(pid.as_u32()).map_err(|e| format!("Failed to access process PID {} (access denied - try running as administrator): {}", pid.as_u32(), e))?;
         let syringe = Syringe::for_process(process);
-        let injected = syringe.inject(&path).map_err(|e| e.to_string())?;
-        println!("DLL injected");
+        let injected = syringe.inject(&path).map_err(|e| format!("DLL injection failed for {}: {} (ensure DLL exists and is valid)", path, e))?;
+        println!("DLL injected successfully");
+        
         unsafe {
             let remote_proc = syringe
                 .get_raw_procedure::<extern "system" fn() -> i32>(injected, function)
-                .map_err(|e| e.to_string())?
-                .ok_or("Procedure not found")?;
-            let result = remote_proc.call().map_err(|e| e.to_string())?;
-            println!("{function} returned: {}", result);
+                .map_err(|e| format!("Failed to get procedure {}: {}", function, e))?
+                .ok_or(format!("Procedure {} not found in DLL", function))?;
+            let result = remote_proc.call().map_err(|e| format!("Failed to call function {}: {}", function, e))?;
+            println!("{} returned: {}", function, result);
         }
         Ok(())
     }
@@ -656,6 +714,99 @@ impl PluginApp {
     }
 
     // Helper functions for advanced PE manipulation
+
+    pub fn rva_to_offset(data: &[u8], rva: usize) -> Result<usize, String> {
+        let e_lfanew = u32::from_le_bytes(data[0x3C..0x40].try_into().unwrap()) as usize;
+        let number_of_sections = u16::from_le_bytes(data[e_lfanew + 6..e_lfanew + 8].try_into().unwrap()) as usize;
+        let optional_header_size = u16::from_le_bytes(data[e_lfanew + 20..e_lfanew + 22].try_into().unwrap()) as usize;
+        let section_table = e_lfanew + 24 + optional_header_size;
+
+        for i in 0..number_of_sections {
+            let offset = section_table + i * 40;
+            let virtual_address = u32::from_le_bytes(data[offset + 12..offset + 16].try_into().unwrap()) as usize;
+            let size_of_raw_data = u32::from_le_bytes(data[offset + 16..offset + 20].try_into().unwrap()) as usize;
+            let pointer_to_raw_data = u32::from_le_bytes(data[offset + 20..offset + 24].try_into().unwrap()) as usize;
+
+            if rva >= virtual_address && rva < virtual_address + size_of_raw_data {
+                return Ok(rva - virtual_address + pointer_to_raw_data);
+            }
+        }
+
+        Err("Could not get Offset from RVA".to_string())
+    }
+
+    pub fn get_export_rva(data: &[u8], function_name: &str) -> Result<u32, String> {
+        if data.len() < 64 || &data[0..2] != b"MZ" {
+            return Err("Invalid DOS header".to_string());
+        }
+
+        let e_lfanew = u32::from_le_bytes(data[0x3C..0x40].try_into().unwrap()) as usize;
+        if &data[e_lfanew..e_lfanew + 4] != b"PE\0\0" {
+            return Err("Invalid NT header".to_string());
+        }
+
+        let optional_header = &data[e_lfanew + 0x18..];
+        let magic = u16::from_le_bytes(optional_header[0..2].try_into().unwrap());
+
+        let export_dir_rva = if magic == 0x10B {
+            u32::from_le_bytes(optional_header[96..100].try_into().unwrap()) as usize // PE32
+        } else if magic == 0x20B {
+            u32::from_le_bytes(optional_header[112..116].try_into().unwrap()) as usize // PE32+
+        } else {
+            return Err("Unknown PE magic".to_string());
+        };
+
+        let export_offset = Self::rva_to_offset(data, export_dir_rva).map_err(|e| format!("Invalid export directory RVA: {e}"))?;
+
+        let number_of_names = u32::from_le_bytes(data[export_offset + 24..export_offset + 28].try_into().unwrap()) as usize;
+
+        let address_of_functions_rva = u32::from_le_bytes(data[export_offset + 28..export_offset + 32].try_into().unwrap()) as usize;
+        let address_of_names_rva = u32::from_le_bytes(data[export_offset + 32..export_offset + 36].try_into().unwrap()) as usize;
+        let address_of_name_ordinals_rva = u32::from_le_bytes(data[export_offset + 36..export_offset + 40].try_into().unwrap()) as usize;
+
+        let address_of_functions = Self::rva_to_offset(data, address_of_functions_rva).map_err(|e| format!("Invalid AddressOfFunctions RVA: {e}"))?;
+        let address_of_names = Self::rva_to_offset(data, address_of_names_rva).map_err(|e| format!("Invalid AddressOfNames RVA: {e}"))?;
+        let address_of_name_ordinals = Self::rva_to_offset(data, address_of_name_ordinals_rva).map_err(|e| format!("Invalid AddressOfNameOrdinals RVA: {e}"))?;
+
+        for i in 0..number_of_names {
+            // This is correct: reading RVA of i-th name string
+            let name_rva = u32::from_le_bytes(
+                data[address_of_names + i * 4..address_of_names + i * 4 + 4].try_into().unwrap()
+            ) as usize;
+
+            // Convert name RVA -> file offset
+            let name_offset = Self::rva_to_offset(data, name_rva)
+                .map_err(|e| format!("Invalid name_offset RVA: {e}"))?;
+
+            // Read the null-terminated name string
+            let name_end = data[name_offset..]
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(data.len() - name_offset)
+                + name_offset;
+
+            let name = std::str::from_utf8(&data[name_offset..name_end])
+                .map_err(|e| format!("Invalid name UTF-8: {e}"))?;
+
+            if name == function_name {
+                let ordinal = u16::from_le_bytes(
+                    data[address_of_name_ordinals + i * 2..address_of_name_ordinals + i * 2 + 2]
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+
+                let rva = u32::from_le_bytes(
+                    data[address_of_functions + ordinal * 4..address_of_functions + ordinal * 4 + 4]
+                        .try_into()
+                        .unwrap(),
+                );
+
+                return Ok(rva);
+            }
+        }
+
+        Err("Function not found in export table".to_string())
+    }
 
     fn parse_pe_headers(dll_data: &[u8]) -> Result<(usize, u32, usize), String> {
         if dll_data.len() < 64 || &dll_data[0..2] != b"MZ" {

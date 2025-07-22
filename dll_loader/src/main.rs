@@ -199,15 +199,9 @@ impl eframe::App for PluginApp {
                                                 self.load_err.push(format!("Hollowed out process: {dummy_process}: proc_info: {proc_info:#?}"));
                                                 match Self::inject_hollowed_process_improved(&std::fs::read(format!("{}/{plugin}", self.plugin_dir)).unwrap_or_default(), proc_info.hProcess, function, proc_info.dwProcessId) {
                                                     Ok(_) => {
-                                                        self.load_err.push(format!("Injected {plugin} to PID {}", proc_info.dwProcessId));
-                                                        let path = format!("{}\\{}", self.plugin_dir, plugin);
-                                                        let tx = self.tx.clone();
-                                                        match Self::call_exported_fn(plugin.clone(), path, function.clone(), pid, tx.clone()) {
-                                                            Ok(_) => { let _ = tx.try_send(format!("Called Exported Fn")); },
-                                                            Err(e) => { let _ = tx.try_send(e.to_string()); },
-                                                        }
+                                                        self.load_err.push(format!("Successfully hollowed process and executed {function} in PID {}", proc_info.dwProcessId));
                                                     },
-                                                    Err(e) => self.load_err.push(format!("Error injecting {plugin} into PID {}: {e}", proc_info.dwProcessId)),
+                                                    Err(e) => self.load_err.push(format!("Error in process hollowing for PID {}: {e}", proc_info.dwProcessId)),
                                                 }
                                             }
                                             Err(e) => self.load_err.push(format!("Error Hollowing out {dummy_process}: {e:?}"))
@@ -415,6 +409,14 @@ impl eframe::App for PluginApp {
                         ui.label("• Ensure DLL is compatible with target process architecture (x64/x86)");
                         ui.label("• Try different injection methods if one fails");
                         ui.label("• Verify target process is not protected by security software");
+                        ui.add_space(5.);
+                        
+                        ui.colored_label(Color32::from_rgb(255, 150, 150), "Common Error Solutions:");
+                        ui.label("• 'Access Denied': Run as Administrator, choose unprotected process");
+                        ui.label("• 'DLL not found': Verify file path, ensure DLL exists");
+                        ui.label("• 'Function not found': Check function is exported from DLL");
+                        ui.label("• 'VirtualAllocEx failed': Target process may be protected");
+                        ui.label("• Process Hollowing 'DLL not found': This is expected - function executed directly");
                         ui.add_space(10.);
 
                         ui.separator();
