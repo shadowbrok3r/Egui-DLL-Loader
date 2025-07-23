@@ -3,6 +3,8 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 use egui_file_dialog::FileDialog;
 use std::{fs::read_dir, sync::Arc};
 use tokio::sync::mpsc;
+
+use crate::inject::enable_debug_privilege;
 pub mod processes;
 pub mod inject;
 
@@ -19,7 +21,8 @@ pub struct PluginApp {
     pub exported_functions: Vec<ExportInfo>,
     pub selected_function: Option<String>,
     pub process_to_hollow: String,
-    file_dialog: FileDialog,
+    process_to_hollow_file_dialog: FileDialog,
+    plugin_dir_file_dialog: FileDialog,
     open_warning_modal: bool,
     first_run: bool,
     process_search_string: String,
@@ -86,7 +89,8 @@ impl PluginApp {
             exported_functions: Vec::new(),
             selected_function: None,
             process_to_hollow: String::new(),
-            file_dialog: FileDialog::new(),
+            process_to_hollow_file_dialog: FileDialog::new(),
+            plugin_dir_file_dialog: FileDialog::new(),
             open_warning_modal: false,
             first_run: true,
             process_search_string: String::new(),
@@ -135,7 +139,16 @@ impl eframe::App for PluginApp {
             ui.horizontal(|ui| {
                 ui.label("Plugin Path:             ");
                 ui.text_edit_singleline(&mut self.plugin_dir);
-                
+                ui.add_space(10.);
+                if ui.button("...").clicked() {
+                    self.plugin_dir_file_dialog.pick_directory();
+                }
+                self.plugin_dir_file_dialog.update(ctx);
+                // Check if the user picked a file.
+                if let Some(path) = self.plugin_dir_file_dialog.take_picked() {
+                    self.plugin_dir = format!("{}", path.to_string_lossy());
+                }
+
                 ui.add_space(10.);
 
                 if ui.button("Scan").clicked() {
@@ -150,9 +163,8 @@ impl eframe::App for PluginApp {
 
                 ui.add_space(10.);
                 
-                ui.label("⚠️ For basic injection, leave both options below unchecked");
-                ui.checkbox(&mut self.evasion_mode, "AV Evasion Mode (may interfere with injection)");
-                ui.checkbox(&mut self.thread_hijack_mode, "Thread Hijacking (alternative to CreateRemoteThread)");
+                ui.checkbox(&mut self.evasion_mode, "AV Evasion Mode");
+                ui.checkbox(&mut self.thread_hijack_mode, "Thread Hijacking");
             });
 
             // Page navigation
@@ -163,8 +175,6 @@ impl eframe::App for PluginApp {
                 ui.selectable_value(&mut self.current_page, InjectionPage::ManualMapping, "Manual Mapping");
                 ui.selectable_value(&mut self.current_page, InjectionPage::Help, "Help");
             });
-            
-            ui.separator();
 
             // Page-specific controls
             match self.current_page {
@@ -174,12 +184,12 @@ impl eframe::App for PluginApp {
                         ui.text_edit_singleline(&mut self.process_to_hollow);
                         ui.add_space(10.);
                         if ui.button("...").clicked() {
-                            self.file_dialog.pick_file();
+                            self.process_to_hollow_file_dialog.pick_file();
                         }
-                        self.file_dialog.update(ctx);
+                        self.process_to_hollow_file_dialog.update(ctx);
 
                         // Check if the user picked a file.
-                        if let Some(path) = self.file_dialog.take_picked() {
+                        if let Some(path) = self.process_to_hollow_file_dialog.take_picked() {
                             self.process_to_hollow = format!("{}", path.to_string_lossy());
                         }
 
@@ -194,18 +204,18 @@ impl eframe::App for PluginApp {
                                 let tx = self.tx.clone();
                                 if !exe_path.is_empty() {
                                     // Spawn a blocking task for process hollowing and export call
-                                    tokio::spawn(async move {
+                                    tokio::task::spawn_blocking(move || {
                                         use std::fs;
                                         // 1. Create suspended process
                                         let process_info = unsafe { PluginApp::get_process_info(&exe_path) };
                                         match process_info {
-                                            Ok(proc_info) => {
+                                            Ok((proc_info, h_process_all)) => {
                                                 // 2. Read DLL data
                                                 let dll_path = format!("{}\\{}", plugin_dir, plugin);
                                                 let dll_data = match fs::read(&dll_path) {
                                                     Ok(d) => d,
                                                     Err(e) => {
-                                                        let _ = tx.send(format!("Failed to read DLL: {e}")).await;
+                                                        let _ = tx.blocking_send(format!("Failed to read DLL: {e}"));
                                                         return;
                                                     }
                                                 };
@@ -213,9 +223,9 @@ impl eframe::App for PluginApp {
                                                 let inject_result = unsafe {
                                                     PluginApp::inject_hollowed_process_improved(
                                                         &dll_data,
-                                                        proc_info.hProcess,
+                                                        h_process_all,
                                                         &function,
-                                                        0,
+                                                        proc_info.hThread,
                                                     )
                                                 };
                                                 match inject_result {
@@ -227,14 +237,14 @@ impl eframe::App for PluginApp {
                                                         let (preferred_base, _entry_rva, _size_of_image) = match PluginApp::parse_pe_headers(&dll_data) {
                                                             Ok(t) => t,
                                                             Err(e) => {
-                                                                let _ = tx.send(format!("Failed to parse PE headers: {e}")).await;
+                                                                let _ = tx.blocking_send(format!("Failed to parse PE headers: {e}"));
                                                                 return;
                                                             }
                                                         };
                                                         // Call the export again (user can change this logic as needed)
                                                         let call_result = unsafe {
                                                             PluginApp::call_export_in_hollowed_process(
-                                                                proc_info.hProcess,
+                                                                h_process_all,
                                                                 &dll_data,
                                                                 preferred_base,
                                                                 &function,
@@ -242,20 +252,20 @@ impl eframe::App for PluginApp {
                                                         };
                                                         match call_result {
                                                             Ok(()) => {
-                                                                let _ = tx.send(format!("Successfully called export '{function}' in hollowed process")).await;
+                                                                let _ = tx.blocking_send(format!("Successfully called export '{function}' in hollowed process"));
                                                             },
                                                             Err(e) => {
-                                                                let _ = tx.send(format!("Failed to call export: {e}")).await;
+                                                                let _ = tx.blocking_send(format!("Failed to call export: {e}"));
                                                             }
                                                         }
                                                     },
                                                     Err(e) => {
-                                                        let _ = tx.send(format!("Process hollowing failed: {e}")).await;
+                                                        let _ = tx.blocking_send(format!("Process hollowing failed: {e}"));
                                                     }
                                                 }
                                             },
                                             Err(e) => {
-                                                let _ = tx.send(format!("Failed to create suspended process: {e}")).await;
+                                                let _ = tx.blocking_send(format!("Failed to create suspended process: {e}"));
                                             }
                                         }
                                     });
@@ -285,7 +295,7 @@ impl eframe::App for PluginApp {
                                                 tx.send(format!("Reflectively injected into PID {}", pid)).await.ok();
                                             }
                                             Err(e) => {
-                                                tx.send(e).await.ok();
+                                                tx.send(e.to_string()).await.ok();
                                             }
                                         }
                                     });
@@ -315,7 +325,7 @@ impl eframe::App for PluginApp {
                                                 tx.send(format!("Manual mapped into PID {}", pid)).await.ok();
                                             }
                                             Err(e) => {
-                                                tx.send(e).await.ok();
+                                                tx.send(e.to_string()).await.ok();
                                             }
                                         }
                                     });
@@ -535,10 +545,10 @@ impl eframe::App for PluginApp {
                                                     }
                                                     InjectionPage::ProcessHollowing => {
                                                         // This will be handled by the separate hollow process button
-                                                        Err("Use the Hollow Process button for process hollowing".to_string())
+                                                        Err(anyhow::anyhow!("Use the Hollow Process button for process hollowing"))
                                                     }
                                                     InjectionPage::Help => {
-                                                        Err("Help page - no injection available".to_string())
+                                                        Err(anyhow::anyhow!("Help page - no injection available"))
                                                     }
                                                 };
                                                 
@@ -548,7 +558,7 @@ impl eframe::App for PluginApp {
                                                     }
                                                     Err(e) => {
                                                         println!("Error: {e:?}");
-                                                        tx.send(e).await.ok();
+                                                        tx.send(e.to_string()).await.ok();
                                                     }
                                                 }
                                             });
@@ -665,6 +675,8 @@ async fn main() -> eframe::Result<()> {
         use windows::Win32::System::Threading::ABOVE_NORMAL_PRIORITY_CLASS;
         unsafe {
             let _ = SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+            let enable_dbg_privelege = enable_debug_privilege();
+            println!("enable_dbg_privelege: {enable_dbg_privelege:?}");
         }
     }
 

@@ -80,7 +80,7 @@ impl PluginApp {
         Ok(exports)
     }
 
-    pub fn rva_to_offset(data: &[u8], rva: usize) -> anyhow::Result<usize> {
+    pub fn rva_to_offset(data: &[u8], rva: usize) -> anyhow::Result<usize, anyhow::Error> {
         let e_lfanew = u32::from_le_bytes(data[0x3C..0x40].try_into()?) as usize;
         let number_of_sections = u16::from_le_bytes(data[e_lfanew + 6..e_lfanew + 8].try_into()?) as usize;
         let optional_header_size = u16::from_le_bytes(data[e_lfanew + 20..e_lfanew + 22].try_into()?) as usize;
@@ -100,14 +100,14 @@ impl PluginApp {
         Err(anyhow::anyhow!("Could not get Offset from RVA"))
     }
 
-    pub fn get_export_rva(data: &[u8], function_name: &str) -> Result<u32, String> {
+    pub fn get_export_rva(data: &[u8], function_name: &str) -> anyhow::Result<u32, anyhow::Error> {
         if data.len() < 64 || &data[0..2] != b"MZ" {
-            return Err("Invalid DOS header".to_string());
+            return Err(anyhow::anyhow!("Invalid DOS header"));
         }
 
         let e_lfanew = u32::from_le_bytes(data[0x3C..0x40].try_into().unwrap()) as usize;
         if &data[e_lfanew..e_lfanew + 4] != b"PE\0\0" {
-            return Err("Invalid NT header".to_string());
+            return Err(anyhow::anyhow!("Invalid NT header"));
         }
 
         let optional_header = &data[e_lfanew + 0x18..];
@@ -118,10 +118,10 @@ impl PluginApp {
         } else if magic == 0x20B {
             u32::from_le_bytes(optional_header[112..116].try_into().unwrap()) as usize // PE32+
         } else {
-            return Err("Unknown PE magic".to_string());
+            return Err(anyhow::anyhow!("Unknown PE magic"));
         };
 
-        let export_offset = Self::rva_to_offset(data, export_dir_rva).map_err(|e| format!("Invalid export directory RVA: {e:?}"))?;
+        let export_offset = Self::rva_to_offset(data, export_dir_rva).map_err(|e| anyhow::anyhow!("Invalid export directory RVA: {e:?}"))?;
 
         let number_of_names = u32::from_le_bytes(data[export_offset + 24..export_offset + 28].try_into().unwrap()) as usize;
 
@@ -129,9 +129,9 @@ impl PluginApp {
         let address_of_names_rva = u32::from_le_bytes(data[export_offset + 32..export_offset + 36].try_into().unwrap()) as usize;
         let address_of_name_ordinals_rva = u32::from_le_bytes(data[export_offset + 36..export_offset + 40].try_into().unwrap()) as usize;
 
-        let address_of_functions = Self::rva_to_offset(data, address_of_functions_rva).map_err(|e| format!("Invalid AddressOfFunctions RVA: {e:?}"))?;
-        let address_of_names = Self::rva_to_offset(data, address_of_names_rva).map_err(|e| format!("Invalid AddressOfNames RVA: {e:?}"))?;
-        let address_of_name_ordinals = Self::rva_to_offset(data, address_of_name_ordinals_rva).map_err(|e| format!("Invalid AddressOfNameOrdinals RVA: {e:?}"))?;
+        let address_of_functions = Self::rva_to_offset(data, address_of_functions_rva).map_err(|e| anyhow::anyhow!("Invalid AddressOfFunctions RVA: {e:?}"))?;
+        let address_of_names = Self::rva_to_offset(data, address_of_names_rva).map_err(|e| anyhow::anyhow!("Invalid AddressOfNames RVA: {e:?}"))?;
+        let address_of_name_ordinals = Self::rva_to_offset(data, address_of_name_ordinals_rva).map_err(|e| anyhow::anyhow!("Invalid AddressOfNameOrdinals RVA: {e:?}"))?;
 
         for i in 0..number_of_names {
             // This is correct: reading RVA of i-th name string
@@ -141,7 +141,7 @@ impl PluginApp {
 
             // Convert name RVA -> file offset
             let name_offset = Self::rva_to_offset(data, name_rva)
-                .map_err(|e| format!("Invalid name_offset RVA: {e:?}"))?;
+                .map_err(|e| anyhow::anyhow!("Invalid name_offset RVA: {e:?}"))?;
 
             // Read the null-terminated name string
             let name_end = data[name_offset..]
@@ -151,7 +151,7 @@ impl PluginApp {
                 + name_offset;
 
             let name = std::str::from_utf8(&data[name_offset..name_end])
-                .map_err(|e| format!("Invalid name UTF-8: {e:?}"))?;
+                .map_err(|e| anyhow::anyhow!("Invalid name UTF-8: {e:?}"))?;
 
             if name == function_name {
                 let ordinal = u16::from_le_bytes(
@@ -170,7 +170,7 @@ impl PluginApp {
             }
         }
 
-        Err("Function not found in export table".to_string())
+        Err(anyhow::anyhow!("Function not found in export table"))
     }
 
 
