@@ -1,7 +1,15 @@
-use windows::Win32::Security::{AdjustTokenPrivileges, GetSidSubAuthority, GetSidSubAuthorityCount, LookupPrivilegeValueA, TokenIntegrityLevel, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY};
+use std::fs::OpenOptions;
+use std::io::Write;
+fn log_to_file(msg: &str) {
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("C:/temp/hollow_log.txt") {
+        let _ = writeln!(file, "{}", msg);
+    }
+}
+use windows::Win32::Security::{AdjustTokenPrivileges, GetSidSubAuthority, GetSidSubAuthorityCount, LookupPrivilegeValueA, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY};
 use windows::{core::BOOL, Win32::{Foundation::*, System::{LibraryLoader::*, Threading::*, Memory::*, Diagnostics::{Debug::*, ToolHelp::*}}}};
-use windows_strings::{PSTR, PCSTR};
 use dll_syringe::{Syringe, process::OwnedProcess};
+use windows_strings::{PSTR, PCSTR};
+use crossbeam::channel::Sender;
 use std::ffi::c_void;
 use crate::PluginApp;
 use anyhow::Context;
@@ -65,6 +73,16 @@ impl PluginApp {
         // Print a warning if the process might still be suspended
         // (You may want to pass/process_info.hThread here for full automation)
 
+        // EXTREMELY VERBOSE LOGGING for CreateRemoteThread
+        println!("[VERBOSE] About to call CreateRemoteThread:");
+        println!("  process_handle: 0x{:X}", process_handle.0 as usize);
+        println!("  remote_addr (export): 0x{:X}", remote_addr);
+        println!("  remote_addr as fn ptr: {:?}", std::mem::transmute::<usize, *const ()>(remote_addr));
+        println!("  Parameters: lpThreadAttributes=None, dwStackSize=0, lpParameter=None, dwCreationFlags=0, lpThreadId=None");
+        // Check process handle rights
+        use windows::Win32::System::Threading::GetProcessId;
+        let pid = unsafe { GetProcessId(process_handle) };
+        println!("  Target PID: {}", pid);
         // Try to create the remote thread
         let thread_handle = unsafe {
             CreateRemoteThread(
@@ -80,20 +98,33 @@ impl PluginApp {
 
         match thread_handle {
             Ok(handle) => {
-                println!("got thread_handle");
+                println!("[VERBOSE] CreateRemoteThread returned handle: 0x{:X}", handle.0 as usize);
                 if handle.is_invalid() {
+                    println!("[ERROR] CreateRemoteThread returned invalid handle!");
                     return Err(anyhow::anyhow!("CreateRemoteThread failed (invalid handle)"));
                 }
-                unsafe { WaitForSingleObject(handle, INFINITE) };
-                println!("WaitForSingleObject");
-                unsafe { CloseHandle(handle) }?;
-                println!("CloseHandle");
+                let wait_res = unsafe { WaitForSingleObject(handle, INFINITE) };
+                println!("[VERBOSE] WaitForSingleObject returned: 0x{:X}", wait_res.0);
+                let close_res = unsafe { CloseHandle(handle) };
+                println!("[VERBOSE] CloseHandle returned: {:?}", close_res);
                 Ok(())
             },
             Err(e) => {
-                println!("CreateRemoteThread failed: {e:?}");
-                // Print more diagnostic info
-                Err(anyhow::anyhow!("CreateRemoteThread: {e:?} (remote_addr: 0x{:X}, process_handle: 0x{:X})", remote_addr, process_handle.0 as usize))
+                // Print all parameters and error
+                println!("[ERROR] CreateRemoteThread failed: {e:?}");
+                println!("[ERROR] Parameters:");
+                println!("  process_handle: 0x{:X}", process_handle.0 as usize);
+                println!("  remote_addr: 0x{:X}", remote_addr);
+                println!("  remote_addr as fn ptr: {:?}", std::mem::transmute::<usize, *const ()>(remote_addr));
+                println!("  export_name: {}", export_name);
+                println!("  dll_base: 0x{:X}", dll_base);
+                println!("  export_rva: 0x{:X}", export_rva);
+                println!("  Target PID: {}", pid);
+                // Try to get last error
+                use windows::Win32::Foundation::GetLastError;
+                let last_error = unsafe { GetLastError() };
+                println!("  GetLastError: 0x{:X}", last_error.0);
+                Err(anyhow::anyhow!("CreateRemoteThread: {e:?} (remote_addr: 0x{:X}, process_handle: 0x{:X}, GetLastError: 0x{:X})", remote_addr, process_handle.0 as usize, last_error.0))
             }
         }
     }
@@ -197,9 +228,10 @@ impl PluginApp {
         dll_data: &[u8],
         process_handle: HANDLE,
         function_name: &str,
-        main_thread_handle: HANDLE // <-- pass main thread handle here
+        main_thread_handle: HANDLE
     ) -> anyhow::Result<(), anyhow::Error> {
         unsafe {
+        log_to_file("[hollow] Starting inject_hollowed_process_improved");
             // Get proper entry point and base address
             let (preferred_base, entry_rva, size_of_image) = Self::parse_pe_headers(dll_data)?;
 
@@ -222,11 +254,13 @@ impl PluginApp {
                     PAGE_EXECUTE_READWRITE,
                 );
                 if alloc.is_null() {
+            log_to_file("[hollow][error] VirtualAllocEx failed");
                     return Err(anyhow::anyhow!("VirtualAllocEx failed"));
                 }
             }
 
             let actual_base = alloc as usize;
+        log_to_file(&format!("[hollow] DLL allocated at 0x{:X} (size: 0x{:X})", actual_base, size_of_image));
             println!("[debug] DLL allocated at 0x{:X} (size: 0x{:X})", actual_base, size_of_image);
 
             // Debug: check memory protection of allocated region
@@ -249,62 +283,126 @@ impl PluginApp {
             }
 
             // Map PE sections
+            log_to_file("[hollow] Mapping PE sections");
             Self::map_pe_sections(dll_data, process_handle, alloc)?;
 
             // Apply relocations if base changed
             if actual_base != preferred_base {
+                log_to_file("[hollow] Applying relocations");
                 Self::apply_relocations(dll_data, process_handle, alloc, preferred_base, actual_base)?;
             }
 
             // Resolve imports (IAT fixups)
+            log_to_file("[hollow] Resolving imports");
             Self::resolve_imports(dll_data, process_handle, alloc)?;
+            // // Get function RVA and calculate remote address
+            // let function_rva = Self::get_export_rva(dll_data, function_name)?;
+            // let remote_export = actual_base + function_rva as usize;
 
-            // Get function RVA and calculate remote address
-            let function_rva = Self::get_export_rva(dll_data, function_name)?;
-            let remote_entry = actual_base + function_rva as usize;
+            // // --- Shellcode stub (x64) ---
+            // // mov rcx, 0
+            // // mov rax, <remote_export>
+            // // call rax
+            // // mov ecx, 0
+            // // mov rax, <ExitProcess>
+            // // call rax
+            // // ret
+            // let exit_process = GetProcAddress(
+            //     GetModuleHandleA(PCSTR(b"kernel32.dll\0".as_ptr())).unwrap(),
+            //     PCSTR(b"ExitProcess\0".as_ptr()),
+            // ).unwrap() as usize;
 
-            // Debug: check memory protection of export address
-            let mut mbi2 = std::mem::MaybeUninit::<MEMORY_BASIC_INFORMATION>::zeroed();
-            let vq_res2 = VirtualQueryEx(
-                process_handle,
-                Some(remote_entry as *const _),
-                mbi2.as_mut_ptr(),
-                mbi_size,
-            );
-            if vq_res2 == 0 {
-                println!("[debug] VirtualQueryEx failed for export addr: 0x{:X}", remote_entry);
-            } else {
-                let mbi2 = mbi2.assume_init();
-                println!("[debug] VirtualQueryEx export: Base=0x{:X}, RegionSize=0x{:X}, State=0x{:X}, Protect=0x{:X}, Type=0x{:X}",
-                    mbi2.BaseAddress as usize, mbi2.RegionSize, mbi2.State.0, mbi2.Protect.0, mbi2.Type.0);
+            // let mut shellcode: Vec<u8> = vec![
+            //     0x48, 0xC7, 0xC1, 0x00, 0x00, 0x00, 0x00, // mov rcx, 0
+            //     0x48, 0xB8, // mov rax, <remote_export>
+            // ];
+            // shellcode.extend_from_slice(&(remote_export as u64).to_le_bytes());
+            // shellcode.extend_from_slice(&[0xFF, 0xD0]); // call rax
+            // shellcode.extend_from_slice(&[0xB9, 0x00, 0x00, 0x00, 0x00]); // mov ecx, 0
+            // shellcode.extend_from_slice(&[0x48, 0xB8]); // mov rax, <ExitProcess>
+            // shellcode.extend_from_slice(&(exit_process as u64).to_le_bytes());
+            // shellcode.extend_from_slice(&[0xFF, 0xD0]); // call rax
+            // shellcode.push(0xC3); // ret
+
+            // // Allocate memory for shellcode
+            // let shellcode_addr = VirtualAllocEx(
+            //     process_handle,
+            //     None,
+            //     shellcode.len(),
+            //     MEM_COMMIT | MEM_RESERVE,
+            //     PAGE_EXECUTE_READWRITE,
+            // );
+            // if shellcode_addr.is_null() {
+            //     return Err(anyhow::anyhow!("VirtualAllocEx for shellcode failed"));
+            // }
+            // WriteProcessMemory(
+            //     process_handle,
+            //     shellcode_addr,
+            //     shellcode.as_ptr() as _,
+            //     shellcode.len(),
+            //     None,
+            // ).map_err(|e| anyhow::anyhow!("WriteProcessMemory(shellcode) failed: {}", e))?;
+
+            // // Patch the main thread context to start at the shellcode stub
+            // println!("[info] Setting main thread context to shellcode stub (calls export, then ExitProcess)");
+
+            // Patch the main thread context to the original entry point
+            log_to_file("[hollow] Patching main thread context to original entry point");
+            println!("[info] Setting main thread context to original entry point (process hollowing)");
+            let mut context = CONTEXT::default();
+            #[cfg(target_arch = "x86_64")]
+            {
+                context.ContextFlags = CONTEXT_ALL_AMD64;
             }
+            #[cfg(target_arch = "x86")]
+            {
+                context.ContextFlags = CONTEXT_ALL_X86;
+            }
+            GetThreadContext(main_thread_handle, &mut context)?;
+            #[cfg(target_arch = "x86_64")]
+            {
+                context.Rip = actual_base as u64 + entry_rva as u64;
+                println!("[info] Set CONTEXT.Rip = 0x{:X} (original entry point)", actual_base + entry_rva as usize);
+            }
+            #[cfg(target_arch = "x86")]
+            {
+                context.Eip = actual_base as u32 + entry_rva as u32;
+                println!("[info] Set CONTEXT.Eip = 0x{:X} (original entry point)", actual_base + entry_rva as usize);
+            }
+            SetThreadContext(main_thread_handle, &context)?;
 
-            // Resume the main thread before creating remote thread
-            use windows::Win32::System::Threading::ResumeThread;
+            println!("[info] Main thread context patched. Resuming main thread...");
+            log_to_file("[hollow] Resuming main thread");
             let resume_count = ResumeThread(main_thread_handle);
             println!("[info] ResumeThread(main) returned: {}", resume_count);
-            // Wait a short time for process loader to initialize
-            std::thread::sleep(std::time::Duration::from_millis(300));
 
-            // Create remote thread at the function
+            // Wait for process to initialize (e.g., 500ms)
+            log_to_file("[hollow] Waiting for process to initialize (2s)");
+            std::thread::sleep(std::time::Duration::from_millis(2000));
+
+            // Now call the export via CreateRemoteThread
+            log_to_file("[hollow] Preparing to call export via CreateRemoteThread");
+            let function_rva = Self::get_export_rva(dll_data, function_name)?;
+            let remote_export = actual_base + function_rva as usize;
+            log_to_file(&format!("[hollow] Calling export '{}' at 0x{:X}", function_name, remote_export));
+            println!("[info] Calling export '{}' at 0x{:X} via CreateRemoteThread", function_name, remote_export);
             let thread_handle = CreateRemoteThread(
                 process_handle,
                 None,
                 0,
-                Some(std::mem::transmute(remote_entry)),
+                Some(std::mem::transmute(remote_export)),
                 None,
                 0,
                 None,
             )?;
-
             if thread_handle.is_invalid() {
-                return Err(anyhow::anyhow!("CreateRemoteThread failed"));
+                log_to_file("[hollow][error] CreateRemoteThread for export failed");
+                return Err(anyhow::anyhow!("CreateRemoteThread for export failed"));
             }
-
-            // Wait for completion
+            log_to_file("[hollow] Waiting for export thread to finish");
             WaitForSingleObject(thread_handle, INFINITE);
             CloseHandle(thread_handle)?;
-
+            log_to_file("[hollow] Export thread finished, injection complete");
             Ok(())
         }
     }
@@ -819,7 +917,7 @@ impl PluginApp {
         path: String, 
         function: String, 
         pid: u32,
-        tx: tokio::sync::mpsc::Sender<String>
+        tx: Sender<String>
     ) -> anyhow::Result<(), anyhow::Error> {
         unsafe {
             let data = std::fs::read(&path)?;
@@ -854,7 +952,7 @@ impl PluginApp {
                 return Err(anyhow::anyhow!("CreateRemoteThread failed"));
             }
             tokio::spawn(async move {
-                tx.send(format!("Called '{}'", function)).await.ok();
+                tx.send(format!("Called '{}'", function)).ok();
             });
         }
         Ok(())

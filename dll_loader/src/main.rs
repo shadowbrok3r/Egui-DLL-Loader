@@ -1,8 +1,8 @@
+use crossbeam::channel::{Receiver, Sender};
 use eframe::egui::{self, Color32, Id, Layout, Modal, RichText, ScrollArea, Style};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use egui_file_dialog::FileDialog;
 use std::{fs::read_dir, sync::Arc};
-use tokio::sync::mpsc;
 
 use crate::inject::enable_debug_privilege;
 pub mod processes;
@@ -16,8 +16,10 @@ pub struct PluginApp {
     pub processes: Vec<(String, sysinfo::Pid)>,
     pub target_pid: Option<Pid>,
     pub system: System,
-    pub tx: mpsc::Sender<String>,
-    pub rx: mpsc::Receiver<String>,
+    pub tx: Sender<String>,
+    pub rx: Receiver<String>,
+    pub pid_tx: Sender<Pid>,
+    pub pid_rx: Receiver<Pid>,
     pub exported_functions: Vec<ExportInfo>,
     pub selected_function: Option<String>,
     pub process_to_hollow: String,
@@ -74,7 +76,8 @@ impl PluginApp {
                 .collect();
         }
 
-        let (tx, rx) = mpsc::channel(32);
+        let (tx, rx) = crossbeam::channel::unbounded();
+        let (pid_tx, pid_rx) = crossbeam::channel::unbounded();
 
         Self {
             plugin_dir: default_dir,
@@ -86,6 +89,7 @@ impl PluginApp {
             target_pid: None,
             tx,
             rx,
+            pid_tx, pid_rx,
             exported_functions: Vec::new(),
             selected_function: None,
             process_to_hollow: String::new(),
@@ -120,8 +124,13 @@ impl PluginApp {
 impl eframe::App for PluginApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Ok(msg) = self.rx.try_recv() {
-            println!("Err: {msg:?}");
+            println!("MSG: {msg:?}");
             self.load_err.push(msg);
+        }
+
+        while let Ok(pid) = self.pid_rx.try_recv() {
+            println!("Got PID: {pid:?}");
+            self.target_pid = Some(pid);
         }
 
         if self.first_run {
@@ -202,24 +211,27 @@ impl eframe::App for PluginApp {
                                 let function = function.clone();
                                 let plugin = plugin.clone();
                                 let tx = self.tx.clone();
+                                let pid_tx = self.pid_tx.clone();
                                 if !exe_path.is_empty() {
+                                    
                                     // Spawn a blocking task for process hollowing and export call
-                                    tokio::task::spawn_blocking(move || {
+                                    std::thread::spawn(move || {
                                         use std::fs;
                                         // 1. Create suspended process
                                         let process_info = unsafe { PluginApp::get_process_info(&exe_path) };
                                         match process_info {
                                             Ok((proc_info, h_process_all)) => {
+                                                let _ = pid_tx.send(Pid::from_u32(proc_info.dwProcessId));
                                                 // 2. Read DLL data
                                                 let dll_path = format!("{}\\{}", plugin_dir, plugin);
                                                 let dll_data = match fs::read(&dll_path) {
                                                     Ok(d) => d,
                                                     Err(e) => {
-                                                        let _ = tx.blocking_send(format!("Failed to read DLL: {e}"));
+                                                        let _ = tx.send(format!("Failed to read DLL: {e}"));
                                                         return;
                                                     }
                                                 };
-                                                // 3. Inject DLL into hollowed process
+                                                // 3. Inject DLL into hollowed process (calls export before resuming main thread)
                                                 let inject_result = unsafe {
                                                     PluginApp::inject_hollowed_process_improved(
                                                         &dll_data,
@@ -230,42 +242,15 @@ impl eframe::App for PluginApp {
                                                 };
                                                 match inject_result {
                                                     Ok(()) => {
-                                                        // 4. Resume process (if needed)
-                                                        let _ = unsafe { windows::Win32::System::Threading::ResumeThread(proc_info.hThread) };
-                                                        // 5. Now allow calling any export
-                                                        //    (for demo, call the same export again)
-                                                        let (preferred_base, _entry_rva, _size_of_image) = match PluginApp::parse_pe_headers(&dll_data) {
-                                                            Ok(t) => t,
-                                                            Err(e) => {
-                                                                let _ = tx.blocking_send(format!("Failed to parse PE headers: {e}"));
-                                                                return;
-                                                            }
-                                                        };
-                                                        // Call the export again (user can change this logic as needed)
-                                                        let call_result = unsafe {
-                                                            PluginApp::call_export_in_hollowed_process(
-                                                                h_process_all,
-                                                                &dll_data,
-                                                                preferred_base,
-                                                                &function,
-                                                            )
-                                                        };
-                                                        match call_result {
-                                                            Ok(()) => {
-                                                                let _ = tx.blocking_send(format!("Successfully called export '{function}' in hollowed process"));
-                                                            },
-                                                            Err(e) => {
-                                                                let _ = tx.blocking_send(format!("Failed to call export: {e}"));
-                                                            }
-                                                        }
+                                                        let _ = tx.send(format!("Successfully injected and called export '{function}' in hollowed process"));
                                                     },
                                                     Err(e) => {
-                                                        let _ = tx.blocking_send(format!("Process hollowing failed: {e}"));
+                                                        let _ = tx.send(format!("Process hollowing failed: {e}"));
                                                     }
                                                 }
                                             },
                                             Err(e) => {
-                                                let _ = tx.blocking_send(format!("Failed to create suspended process: {e}"));
+                                                let _ = tx.send(format!("Failed to create suspended process: {e}"));
                                             }
                                         }
                                     });
@@ -292,10 +277,10 @@ impl eframe::App for PluginApp {
                                     tokio::spawn(async move {
                                         match unsafe { PluginApp::inject_reflective_dll(pid, &plugin_dir, &plugin, &function) }.await {
                                             Ok(()) => {
-                                                tx.send(format!("Reflectively injected into PID {}", pid)).await.ok();
+                                                tx.send(format!("Reflectively injected into PID {}", pid)).ok();
                                             }
                                             Err(e) => {
-                                                tx.send(e.to_string()).await.ok();
+                                                tx.send(e.to_string()).ok();
                                             }
                                         }
                                     });
@@ -322,10 +307,10 @@ impl eframe::App for PluginApp {
                                     tokio::spawn(async move {
                                         match unsafe { PluginApp::inject_manual_map(pid, &plugin_dir, &plugin, &function) }.await {
                                             Ok(()) => {
-                                                tx.send(format!("Manual mapped into PID {}", pid)).await.ok();
+                                                tx.send(format!("Manual mapped into PID {}", pid)).ok();
                                             }
                                             Err(e) => {
-                                                tx.send(e.to_string()).await.ok();
+                                                tx.send(e.to_string()).ok();
                                             }
                                         }
                                     });
@@ -554,11 +539,11 @@ impl eframe::App for PluginApp {
                                                 
                                                 match result {
                                                     Ok(()) => {
-                                                        tx.send(format!("Injected into PID {}", pid)).await.ok();
+                                                        tx.send(format!("Injected into PID {}", pid)).ok();
                                                     }
                                                     Err(e) => {
                                                         println!("Error: {e:?}");
-                                                        tx.send(e.to_string()).await.ok();
+                                                        tx.send(e.to_string()).ok();
                                                     }
                                                 }
                                             });

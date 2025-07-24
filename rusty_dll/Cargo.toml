@@ -9,3 +9,4 @@ crate-type = ["cdylib"]
 [dependencies]
 libloading = { workspace = true }
 winapi = { workspace = true }
+windows = { workspace = true }
