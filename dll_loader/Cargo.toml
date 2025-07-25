@@ -23,7 +23,7 @@ windows = { workspace = true }
 windows-strings = "0.4.2"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
-rand = "0.8.5"
+rand = "0.9.2"
 crossbeam = "0.8.4"
 # ntapi = "0.4.1"
 goblin = "0.10.0"

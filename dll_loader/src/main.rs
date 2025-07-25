@@ -2,7 +2,8 @@ use crossbeam::channel::{Receiver, Sender};
 use eframe::egui::{self, Color32, Id, Layout, Modal, RichText, ScrollArea, Style};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use egui_file_dialog::FileDialog;
-use std::{fs::read_dir, sync::Arc};
+use windows::Win32::Foundation::NTSTATUS;
+use std::{ffi::c_void, fs::read_dir, sync::Arc};
 
 use crate::inject::enable_debug_privilege;
 pub mod processes;
@@ -52,7 +53,7 @@ pub struct ExportInfo {
 
 impl PluginApp {
     fn new() -> Self {
-        let default_dir = "target/release".to_string();
+        let default_dir = "../target/release".to_string();
         // let cwd = std::env::current_dir().unwrap_or_default();
         let mut system = System::new_all();
         system.refresh_processes(ProcessesToUpdate::All, true);
@@ -94,8 +95,18 @@ impl PluginApp {
             exported_functions: Vec::new(),
             selected_function: None,
             process_to_hollow: "C:\\Windows\\notepad.exe".to_string(),
-            process_to_hollow_file_dialog: FileDialog::new(),
-            plugin_dir_file_dialog: FileDialog::new(),
+            process_to_hollow_file_dialog: FileDialog::new()
+                .show_hidden_option(true)
+                .initial_directory("C:\\".into())
+                .add_file_filter_extensions("Targets", vec!["exe"])
+                .default_file_filter("Targets")
+                .show_search(true),
+            plugin_dir_file_dialog: FileDialog::new()
+                .show_hidden_option(true)
+                .initial_directory("C:\\".into())
+                .add_file_filter_extensions("Plugins", vec!["exe", "dll"])
+                .default_file_filter("Plugins")
+                .show_search(true),
             open_warning_modal: false,
             first_run: true,
             process_search_string: String::new(),
@@ -329,16 +340,16 @@ impl eframe::App for PluginApp {
                                     let tx = self.tx.clone();
                                     let plugin = plugin.clone();
                                     let function = function.clone();
-                                    tokio::spawn(async move {
-                                        match unsafe { PluginApp::inject_manual_map(pid, &plugin_dir, &plugin, &function) }.await {
-                                            Ok(()) => {
-                                                tx.send(format!("Manual mapped into PID {}", pid)).ok();
-                                            }
-                                            Err(e) => {
-                                                tx.send(e.to_string()).ok();
-                                            }
-                                        }
-                                    });
+                                    // tokio::spawn(async move {
+                                    //     match unsafe { PluginApp::inject_manual_map(pid, &plugin_dir, &plugin, &function) }.await {
+                                    //         Ok(()) => {
+                                    //             tx.send(format!("Manual mapped into PID {}", pid)).ok();
+                                    //         }
+                                    //         Err(e) => {
+                                    //             tx.send(e.to_string()).ok();
+                                    //         }
+                                    //     }
+                                    // });
                                 } else {
                                     self.open_warning_modal = true;
                                 }
@@ -551,7 +562,8 @@ impl eframe::App for PluginApp {
                                                         unsafe { PluginApp::inject_reflective_dll(pid, &plugin_dir, &plugin, &function) }.await
                                                     }
                                                     InjectionPage::ManualMapping => {
-                                                        unsafe { PluginApp::inject_manual_map(pid, &plugin_dir, &plugin, &function) }.await
+                                                        Err(anyhow::anyhow!("Not implemented yet"))
+                                                        // unsafe { PluginApp::inject_manual_map(pid, &plugin_dir, &plugin, &function) }.await
                                                     }
                                                     InjectionPage::ProcessHollowing => {
                                                         // This will be handled by the separate hollow process button
@@ -699,5 +711,19 @@ async fn main() -> eframe::Result<()> {
     )
 }
 
+
+// These ntdll functions are necessary for advanced process manipulation.
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtQueryInformationProcess(
+        ProcessHandle: std::os::windows::raw::HANDLE,
+        ProcessInformationClass: u32,
+        ProcessInformation: *mut c_void,
+        ProcessInformationLength: u32,
+        ReturnLength: *mut u32,
+    ) -> NTSTATUS;
+
+    fn NtUnmapViewOfSection(ProcessHandle: std::os::windows::raw::HANDLE, BaseAddress: *mut c_void) -> NTSTATUS;
+}
 
 const STYLE: &str = r#"{"override_text_style":null,"override_font_id":null,"override_text_valign":"Center","text_styles":{"Small":{"size":10.0,"family":"Proportional"},"Body":{"size":14.0,"family":"Proportional"},"Monospace":{"size":12.0,"family":"Monospace"},"Button":{"size":14.0,"family":"Proportional"},"Heading":{"size":18.0,"family":"Proportional"}},"drag_value_text_style":"Button","wrap":null,"wrap_mode":null,"spacing":{"item_spacing":{"x":3.0,"y":3.0},"window_margin":{"left":12,"right":12,"top":12,"bottom":12},"button_padding":{"x":5.0,"y":3.0},"menu_margin":{"left":12,"right":12,"top":12,"bottom":12},"indent":18.0,"interact_size":{"x":40.0,"y":20.0},"slider_width":100.0,"slider_rail_height":8.0,"combo_width":100.0,"text_edit_width":280.0,"icon_width":14.0,"icon_width_inner":8.0,"icon_spacing":6.0,"default_area_size":{"x":600.0,"y":400.0},"tooltip_width":600.0,"menu_width":400.0,"menu_spacing":2.0,"indent_ends_with_horizontal_line":false,"combo_height":200.0,"scroll":{"floating":true,"bar_width":6.0,"handle_min_length":12.0,"bar_inner_margin":4.0,"bar_outer_margin":0.0,"floating_width":2.0,"floating_allocated_width":0.0,"foreground_color":true,"dormant_background_opacity":0.0,"active_background_opacity":0.4,"interact_background_opacity":0.7,"dormant_handle_opacity":0.0,"active_handle_opacity":0.6,"interact_handle_opacity":1.0}},"interaction":{"interact_radius":5.0,"resize_grab_radius_side":5.0,"resize_grab_radius_corner":10.0,"show_tooltips_only_when_still":true,"tooltip_delay":0.5,"tooltip_grace_time":0.2,"selectable_labels":true,"multi_widget_text_select":true},"visuals":{"dark_mode":true,"text_alpha_from_coverage":"TwoCoverageMinusCoverageSq","override_text_color":[207,216,220,255],"weak_text_alpha":0.6,"weak_text_color":null,"widgets":{"noninteractive":{"bg_fill":[0,0,0,0],"weak_bg_fill":[61,61,61,232],"bg_stroke":{"width":1.0,"color":[71,71,71,247]},"corner_radius":{"nw":6,"ne":6,"sw":6,"se":6},"fg_stroke":{"width":1.0,"color":[207,216,220,255]},"expansion":0.0},"inactive":{"bg_fill":[58,51,106,0],"weak_bg_fill":[8,8,8,231],"bg_stroke":{"width":1.5,"color":[48,51,73,255]},"corner_radius":{"nw":6,"ne":6,"sw":6,"se":6},"fg_stroke":{"width":1.0,"color":[207,216,220,255]},"expansion":0.0},"hovered":{"bg_fill":[37,29,61,97],"weak_bg_fill":[95,62,97,69],"bg_stroke":{"width":1.7,"color":[106,101,155,255]},"corner_radius":{"nw":6,"ne":6,"sw":6,"se":6},"fg_stroke":{"width":1.5,"color":[83,87,88,35]},"expansion":2.0},"active":{"bg_fill":[12,12,15,255],"weak_bg_fill":[39,37,54,214],"bg_stroke":{"width":1.0,"color":[12,12,16,255]},"corner_radius":{"nw":6,"ne":6,"sw":6,"se":6},"fg_stroke":{"width":2.0,"color":[207,216,220,255]},"expansion":1.0},"open":{"bg_fill":[20,22,28,255],"weak_bg_fill":[17,18,22,255],"bg_stroke":{"width":1.8,"color":[42,44,93,165]},"corner_radius":{"nw":6,"ne":6,"sw":6,"se":6},"fg_stroke":{"width":1.0,"color":[109,109,109,255]},"expansion":0.0}},"selection":{"bg_fill":[23,64,53,27],"stroke":{"width":1.0,"color":[12,12,15,255]}},"hyperlink_color":[135,85,129,255],"faint_bg_color":[17,18,22,255],"extreme_bg_color":[9,12,15,83],"text_edit_bg_color":null,"code_bg_color":[30,31,35,255],"warn_fg_color":[61,185,157,255],"error_fg_color":[255,55,102,255],"window_corner_radius":{"nw":6,"ne":6,"sw":6,"se":6},"window_shadow":{"offset":[0,0],"blur":7,"spread":5,"color":[17,17,41,118]},"window_fill":[11,11,15,255],"window_stroke":{"width":1.0,"color":[77,94,120,138]},"window_highlight_topmost":true,"menu_corner_radius":{"nw":6,"ne":6,"sw":6,"se":6},"panel_fill":[12,12,15,255],"popup_shadow":{"offset":[0,0],"blur":8,"spread":3,"color":[19,18,18,96]},"resize_corner_size":18.0,"text_cursor":{"stroke":{"width":2.0,"color":[197,192,255,255]},"preview":true,"blink":true,"on_duration":0.5,"off_duration":0.5},"clip_rect_margin":3.0,"button_frame":true,"collapsing_header_frame":true,"indent_has_left_vline":true,"striped":true,"slider_trailing_fill":true,"handle_shape":{"Rect":{"aspect_ratio":0.5}},"interact_cursor":"Crosshair","image_loading_spinners":true,"numeric_color_space":"GammaByte","disabled_alpha":0.5},"animation_time":0.083333336,"debug":{"debug_on_hover":false,"debug_on_hover_with_all_modifiers":false,"hover_shows_next":false,"show_expand_width":false,"show_expand_height":false,"show_resize":false,"show_interactive_widgets":false,"show_widget_hits":false,"show_unaligned":true},"explanation_tooltips":false,"url_in_tooltip":false,"always_scroll_the_only_direction":true,"scroll_animation":{"points_per_second":1000.0,"duration":{"min":0.1,"max":0.3}},"compact_menu_style":true}"#;
