@@ -52,7 +52,8 @@ pub struct ExportInfo {
 
 impl PluginApp {
     fn new() -> Self {
-        let default_dir = "C:\\Users\\shadowbroker\\Desktop\\egui_dll_loader\\target\\release".to_string();
+        let default_dir = "target/release".to_string();
+        // let cwd = std::env::current_dir().unwrap_or_default();
         let mut system = System::new_all();
         system.refresh_processes(ProcessesToUpdate::All, true);
         let mut processes = system
@@ -67,7 +68,7 @@ impl PluginApp {
             plugins = entries
                 .filter_map(|e| {
                     let path = e.ok()?.path();
-                    if path.extension().map(|e| e == "dll").unwrap_or(false) {
+                    if path.extension().map(|e| e == "dll" || e == "exe").unwrap_or(false) {
                         path.file_name()?.to_str().map(String::from)
                     } else {
                         None
@@ -92,7 +93,7 @@ impl PluginApp {
             pid_tx, pid_rx,
             exported_functions: Vec::new(),
             selected_function: None,
-            process_to_hollow: String::new(),
+            process_to_hollow: "C:\\Windows\\notepad.exe".to_string(),
             process_to_hollow_file_dialog: FileDialog::new(),
             plugin_dir_file_dialog: FileDialog::new(),
             open_warning_modal: false,
@@ -110,7 +111,7 @@ impl PluginApp {
             self.plugins = entries
                 .filter_map(|e| {
                     let path = e.ok()?.path();
-                    if path.extension().map(|e| e == "dll").unwrap_or(false) {
+                    if path.extension().map(|e| e == "dll" || e == "exe").unwrap_or(false) {
                         path.file_name()?.to_str().map(String::from)
                     } else {
                         None
@@ -213,47 +214,71 @@ impl eframe::App for PluginApp {
                                 let tx = self.tx.clone();
                                 let pid_tx = self.pid_tx.clone();
                                 if !exe_path.is_empty() {
-                                    
-                                    // Spawn a blocking task for process hollowing and export call
-                                    std::thread::spawn(move || {
-                                        use std::fs;
-                                        // 1. Create suspended process
-                                        let process_info = unsafe { PluginApp::get_process_info(&exe_path) };
-                                        match process_info {
-                                            Ok((proc_info, h_process_all)) => {
-                                                let _ = pid_tx.send(Pid::from_u32(proc_info.dwProcessId));
-                                                // 2. Read DLL data
-                                                let dll_path = format!("{}\\{}", plugin_dir, plugin);
-                                                let dll_data = match fs::read(&dll_path) {
-                                                    Ok(d) => d,
-                                                    Err(e) => {
-                                                        let _ = tx.send(format!("Failed to read DLL: {e}"));
-                                                        return;
+                                    if plugin.ends_with("dll") {
+                                        // Spawn a blocking task for process hollowing and export call
+                                        std::thread::spawn(move || {
+                                            use std::fs;
+                                            // 1. Create suspended process
+                                            let process_info = unsafe { PluginApp::get_process_info(&exe_path) };
+                                            match process_info {
+                                                Ok((proc_info, h_process_all)) => {
+                                                    let _ = pid_tx.send(Pid::from_u32(proc_info.dwProcessId));
+                                                    // 2. Read DLL data
+                                                    let dll_path = format!("{}\\{}", plugin_dir, plugin);
+                                                    let dll_data = match fs::read(&dll_path) {
+                                                        Ok(d) => d,
+                                                        Err(e) => {
+                                                            let _ = tx.send(format!("Failed to read DLL: {e}"));
+                                                            return;
+                                                        }
+                                                    };
+                                                    // 3. Inject DLL into hollowed process (calls export before resuming main thread)
+                                                    let inject_result = unsafe {
+                                                        PluginApp::inject_hollowed_process_improved(
+                                                            &dll_data,
+                                                            h_process_all,
+                                                            &function,
+                                                            proc_info.hThread,
+                                                        )
+                                                    };
+                                                    match inject_result {
+                                                        Ok(()) => {
+                                                            let _ = tx.send(format!("Successfully injected and called export '{function}' in hollowed process"));
+                                                        },
+                                                        Err(e) => {
+                                                            let _ = tx.send(format!("Process hollowing failed: {e}"));
+                                                        }
                                                     }
-                                                };
-                                                // 3. Inject DLL into hollowed process (calls export before resuming main thread)
-                                                let inject_result = unsafe {
-                                                    PluginApp::inject_hollowed_process_improved(
-                                                        &dll_data,
-                                                        h_process_all,
-                                                        &function,
-                                                        proc_info.hThread,
-                                                    )
-                                                };
-                                                match inject_result {
-                                                    Ok(()) => {
-                                                        let _ = tx.send(format!("Successfully injected and called export '{function}' in hollowed process"));
-                                                    },
-                                                    Err(e) => {
-                                                        let _ = tx.send(format!("Process hollowing failed: {e}"));
-                                                    }
+                                                },
+                                                Err(e) => {
+                                                    let _ = tx.send(format!("Failed to create suspended process: {e}"));
                                                 }
-                                            },
-                                            Err(e) => {
-                                                let _ = tx.send(format!("Failed to create suspended process: {e}"));
                                             }
-                                        }
-                                    });
+                                        });
+                                    } else if plugin.ends_with("exe") {
+                                        // std::thread::spawn(move || {
+                                            use std::fs;
+                                            let exe_path = exe_path.clone();
+                                            let plugin_path = format!("{}\\{}", plugin_dir, plugin);
+                                            let pe_data = match fs::read(&plugin_path) {
+                                                Ok(d) => d,
+                                                Err(e) => {
+                                                    let _ = tx.send(format!("Failed to read EXE: {e}"));
+                                                    return;
+                                                }
+                                            };
+                                            let result = unsafe { PluginApp::hollow_process_with_exe(&pe_data, &exe_path) };
+                                            match result {
+                                                Ok(pid) => {
+                                                    let _ = pid_tx.send(Pid::from_u32(pid));
+                                                    let _ = tx.send(format!("Successfully hollowed process with EXE '{plugin}' (PID: {pid})"));
+                                                },
+                                                Err(e) => {
+                                                    let _ = tx.send(format!("Process hollowing with EXE failed: {e}"));
+                                                }
+                                            }
+                                        // });
+                                    }
                                 }
                             } else {
                                 if self.selected_function.is_none() || self.selected_plugin.is_none() {

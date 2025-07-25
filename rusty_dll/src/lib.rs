@@ -1,16 +1,17 @@
 extern crate winapi;
 
 use winapi::um::winuser::{MessageBoxW, MB_OK};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::windows::ffi::OsStrExt;
+use std::ffi::OsStr;
+
 // ...existing code...
 fn log_to_file(msg: &str) {
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("C:/temp/dll_log.txt") {
         let _ = writeln!(file, "{}", msg);
     }
 }
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::os::windows::ffi::OsStrExt;
-use std::ffi::OsStr;
 
 #[unsafe(no_mangle)]
 pub extern "system" fn test_injection() -> i32 {

