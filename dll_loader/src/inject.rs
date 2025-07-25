@@ -190,8 +190,8 @@ impl PluginApp {
                 println!("[hollow/exe][error] GetThreadContext failed: {e}");
                 return Err(anyhow::anyhow!("GetThreadContext failed: {e}"));
             }
-            context.Rip = (new_base + entry_rva) as u64;
-            println!("[hollow/exe] Setting thread RIP to 0x{:X} (entry point)...", (new_base + entry_rva));
+            context.Rip = (new_base as u64 + entry_rva as u64);
+            println!("[hollow/exe] Setting thread RIP to 0x{:X} (entry point)...", (new_base + entry_rva as usize));
             if let Err(e) = SetThreadContext(h_thread, &context) {
                 println!("[hollow/exe][error] SetThreadContext failed: {e}");
                 return Err(anyhow::anyhow!("SetThreadContext failed: {e}"));
