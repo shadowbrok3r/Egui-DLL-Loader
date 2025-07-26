@@ -1,4 +1,8 @@
+use std::ffi::c_void;
+
 use sysinfo::ProcessesToUpdate;
+use windows::{core::BOOL, Win32::{Foundation::{FALSE, HANDLE}, Security::{GetSidSubAuthority, GetSidSubAuthorityCount}, System::Threading::{CreateProcessA, OpenProcess, OpenProcessToken, CREATE_SUSPENDED, PROCESS_ALL_ACCESS, PROCESS_INFORMATION, STARTUPINFOA}}};
+use windows_strings::PSTR;
 
 use crate::{ExportInfo, PluginApp};
 
@@ -24,6 +28,129 @@ impl PluginApp {
                 Ok(exports) => self.exported_functions = exports,
                 Err(e) => self.load_err.push(format!("Failed to list exports: {e:?}")),
             }
+        }
+    }
+
+        // Helper to get the integrity level of a process
+    pub fn get_process_integrity_level(process_handle: HANDLE) -> anyhow::Result<String, anyhow::Error> {
+        use windows::Win32::Security::{GetTokenInformation, TokenIntegrityLevel, TOKEN_MANDATORY_LABEL, TOKEN_QUERY};
+        use std::ptr;
+
+        unsafe {
+            let mut h_token = HANDLE(ptr::null_mut());
+            OpenProcessToken(process_handle, TOKEN_QUERY, &mut h_token)
+                .map_err(|e| anyhow::anyhow!("OpenProcessToken (for integrity level) failed: {e}"))?;
+
+            // Query buffer size
+            let mut size = 0u32;
+            let _ = GetTokenInformation(
+                h_token,
+                TokenIntegrityLevel,
+                None,
+                0,
+                &mut size,
+            );
+            if size == 0 {
+                return Err(anyhow::anyhow!("GetTokenInformation (size query) failed"));
+            }
+
+            let mut buf = vec![0u8; size as usize];
+            let ok = GetTokenInformation(
+                h_token,
+                TokenIntegrityLevel,
+                Some(buf.as_mut_ptr() as *mut _),
+                size,
+                &mut size,
+            );
+            if !ok.is_ok() {
+                return Err(anyhow::anyhow!("GetTokenInformation (data) failed"));
+            }
+
+            let tml = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+            let p_sid = tml.Label.Sid;
+            if p_sid.is_invalid() {
+                return Err(anyhow::anyhow!("SID is invalid"));
+            }
+
+            let sub_auth_count = *GetSidSubAuthorityCount(p_sid);
+            if sub_auth_count == 0 {
+                return Err(anyhow::anyhow!("SID has no subauthorities"));
+            }
+            let rid = *GetSidSubAuthority(p_sid, (sub_auth_count - 1) as u32);
+
+            let level = match rid {
+                0x0000_0000 => "Untrusted",
+                0x0000_1000 => "Low",
+                0x0000_2000 => "Medium",
+                0x0000_2100 => "Medium Plus",
+                0x0000_3000 => "High",
+                0x0000_4000 => "System",
+                0x0000_5000 => "Protected Process",
+                _ => "Other"
+            };
+            Ok(level.to_string())
+        }
+    }
+
+    /// Get remote module base address (HANDLE) for a given DLL name in a process
+    pub fn get_remote_module_base_handle(h_process: HANDLE, module_name: &str) -> anyhow::Result<*mut c_void, anyhow::Error> {
+        use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Module32First, Module32Next, MODULEENTRY32, TH32CS_SNAPMODULE};
+        use std::ffi::CStr;
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, windows::Win32::System::Threading::GetProcessId(h_process) ) };
+        if !snapshot.is_ok() {
+            return Err(anyhow::anyhow!("CreateToolhelp32Snapshot failed"));
+        }
+        let snapshot = snapshot.unwrap();
+        let mut entry = MODULEENTRY32 { dwSize: std::mem::size_of::<MODULEENTRY32>() as u32, ..Default::default() };
+        let mut found = None;
+        if unsafe { Module32First(snapshot, &mut entry) }.is_ok() {
+            loop {
+                let name_ptr = entry.szModule.as_ptr();
+                let name_cstr = unsafe { CStr::from_ptr(name_ptr) };
+                let name_str = name_cstr.to_string_lossy().trim_end_matches(char::from(0)).to_lowercase();
+                if name_str == module_name.to_lowercase() {
+                    found = Some(entry.modBaseAddr as *mut c_void);
+                    break;
+                }
+                if unsafe { Module32Next(snapshot, &mut entry) }.is_err() {
+                    break;
+                }
+            }
+        }
+        unsafe { windows::Win32::Foundation::CloseHandle(snapshot)? };
+        found.ok_or_else(|| anyhow::anyhow!("Module {} not found in remote process", module_name))
+    }
+    
+    // Improved process hollowing with proper PE handling
+    pub unsafe fn get_process_info(exe_path: &str) -> Result<(PROCESS_INFORMATION, HANDLE), String> {
+        unsafe {
+            let mut startup_info = STARTUPINFOA::default();
+            let mut process_info = PROCESS_INFORMATION::default();
+            let mut command_line = format!("{}\0", exe_path);
+
+            CreateProcessA(
+                None,
+                Some(PSTR(command_line.as_mut_ptr())),
+                None,
+                None,
+                BOOL(0).into(),
+                CREATE_SUSPENDED,
+                None,
+                None,
+                &mut startup_info,
+                &mut process_info,
+            )
+            .map_err(|e| format!("CreateProcessA failed: {}", e))?;
+
+            // Open process with PROCESS_ALL_ACCESS for injection
+            let h_process = OpenProcess(
+                PROCESS_ALL_ACCESS,
+                FALSE.into(),
+                process_info.dwProcessId
+            ).map_err(|e| format!("OpenProcess(PROCESS_ALL_ACCESS) failed: {}", e))?;
+
+            // Return both process_info and h_process so caller can resume main thread
+            Ok((process_info, h_process))
         }
     }
 
@@ -113,40 +240,4 @@ impl PluginApp {
         }
         Err(anyhow::anyhow!("Function not found in export table: {}", function_name))
     }
-
-
-    fn _get_exports(file_path: &str) -> Result<Vec<String>, String> {
-        let data = std::fs::read(file_path).map_err(|e| e.to_string())?;
-        println!("Data: {}", data.len());
-        if data.len() < 64 || u16::from_le_bytes([data[0], data[1]]) != 0x5A4D {
-            return Err("Invalid DOS header".to_string());
-        }
-        let e_lfanew = u32::from_le_bytes([data[0x3C], data[0x3D], data[0x3E], data[0x3F]]) as usize;
-        if data.len() < e_lfanew + 24 || u32::from_le_bytes([data[e_lfanew], data[e_lfanew+1], data[e_lfanew+2], data[e_lfanew+3]]) != 0x4550 {
-            return Err("Invalid NT header".to_string());
-        }
-        let optional_rva = e_lfanew + 24;
-        let magic = u16::from_le_bytes([data[optional_rva], data[optional_rva+1]]);
-        if magic != 0x10b {
-            return Err("Not 32bit PE".to_string());
-        }
-        let export_rva = u32::from_le_bytes([data[optional_rva + 88], data[optional_rva + 89], data[optional_rva + 90], data[optional_rva + 91]]) as usize;
-        let export_size = u32::from_le_bytes([data[optional_rva + 92], data[optional_rva + 93], data[optional_rva + 94], data[optional_rva + 95]]) as usize;
-        if export_rva == 0 || export_size == 0 {
-            return Err("No export table".to_string());
-        }
-        let number_of_names = u32::from_le_bytes([data[export_rva + 24], data[export_rva + 25], data[export_rva + 26], data[export_rva + 27]]) as usize;
-        let address_of_names = u32::from_le_bytes([data[export_rva + 32], data[export_rva + 33], data[export_rva + 34], data[export_rva + 35]]) as usize;
-        let mut exports = Vec::with_capacity(number_of_names);
-        for i in 0..number_of_names {
-            let name_rva = u32::from_le_bytes(data[address_of_names + i*4..address_of_names + i*4 + 4].try_into().unwrap()) as usize;
-            if let Ok(name_offset) = Self::rva_to_offset(&data, name_rva) {
-                let len = data[name_offset..].iter().position(|&b| b == 0).unwrap_or(data.len() - name_offset);
-                let name = std::str::from_utf8(&data[name_offset..name_offset + len]).map_err(|e| e.to_string())?.to_string();
-                exports.push(name);
-            }
-        }
-        Ok(exports)
-    }
-
 }
