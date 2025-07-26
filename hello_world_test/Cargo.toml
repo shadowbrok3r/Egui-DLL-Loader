@@ -1,12 +1,8 @@
 [package]
-name = "rusty_dll"
+name = "hello_world_test"
 version = "0.1.0"
 edition = "2024"
 
-[lib]
-crate-type = ["cdylib"]
-
 [dependencies]
-libloading = { workspace = true }
 winapi = { workspace = true }
 windows = { workspace = true }
