@@ -78,6 +78,7 @@ impl PluginApp {
             let block_size = u32::from_le_bytes(pe_data[offset + 4..offset + 8].try_into()?);
             if block_size == 0 { break; }
             let entries_count = (block_size as usize - 8) / 2;
+            log::info!("[reloc] Block: page_rva=0x{:X}, block_size=0x{:X}, entries={}", page_rva, block_size, entries_count);
             for i in 0..entries_count {
                 let entry_offset = offset + 8 + i * 2;
                 let entry = u16::from_le_bytes(pe_data[entry_offset..entry_offset + 2].try_into()?);
@@ -85,25 +86,47 @@ impl PluginApp {
                 let offset_in_page = entry & 0xFFF;
                 let reloc_addr = new_base + page_rva as usize + offset_in_page as usize;
                 // Bounds check: skip if reloc_addr is outside the mapped image
-                if reloc_addr < new_base || reloc_addr + 8 > new_base + image_size {
-                    println!("[reloc][warn] Skipping relocation: address 0x{:X} out of bounds (image base=0x{:X}, size=0x{:X})", reloc_addr, new_base, image_size);
+                let in_bounds = reloc_addr >= new_base && reloc_addr + 8 <= new_base + image_size;
+                log::info!("[reloc] Entry {}: type={}, offset_in_page=0x{:X}, reloc_addr=0x{:X}, in_bounds={}", i, reloc_type, offset_in_page, reloc_addr, in_bounds);
+                if !in_bounds {
+                    log::warn!("[reloc][warn] Skipping relocation: address 0x{:X} out of bounds (image base=0x{:X}, size=0x{:X})", reloc_addr, new_base, image_size);
                     continue;
                 }
                 match reloc_type {
                     3 => { // IMAGE_REL_BASED_HIGHLOW (32-bit)
                         let mut original_value = 0u32;
-                        unsafe { ReadProcessMemory(process_handle, reloc_addr as *const _, &mut original_value as *mut _ as *mut c_void, 4, None) }?;
+                        let read_res = unsafe { ReadProcessMemory(process_handle, reloc_addr as *const _, &mut original_value as *mut _ as *mut c_void, 4, None) };
+                        log::info!("[reloc] ReadProcessMemory (HIGHLOW): addr=0x{:X}, value=0x{:X}, result={:?}", reloc_addr, original_value, read_res.is_ok());
+                        if let Err(e) = read_res {
+                            log::warn!("[reloc][error] ReadProcessMemory failed: {:?}", e);
+                            return Err(e.into());
+                        }
                         let new_value = original_value.wrapping_add(delta as u32);
-                        unsafe { WriteProcessMemory(process_handle, reloc_addr as *mut _, &new_value as *const _ as *const c_void, 4, None) }?;
+                        let write_res = unsafe { WriteProcessMemory(process_handle, reloc_addr as *mut _, &new_value as *const _ as *const c_void, 4, None) };
+                        log::info!("[reloc] WriteProcessMemory (HIGHLOW): addr=0x{:X}, new_value=0x{:X}, result={:?}", reloc_addr, new_value, write_res.is_ok());
+                        if let Err(e) = write_res {
+                            log::warn!("[reloc][error] WriteProcessMemory failed: {:?}", e);
+                            return Err(e.into());
+                        }
                     },
                     10 => { // IMAGE_REL_BASED_DIR64 (64-bit)
                         let mut original_value = 0u64;
-                        unsafe { ReadProcessMemory(process_handle, reloc_addr as *const _, &mut original_value as *mut _ as *mut c_void, 8, None) }?;
+                        let read_res = unsafe { ReadProcessMemory(process_handle, reloc_addr as *const _, &mut original_value as *mut _ as *mut c_void, 8, None) };
+                        log::info!("[reloc] ReadProcessMemory (DIR64): addr=0x{:X}, value=0x{:X}, result={:?}", reloc_addr, original_value, read_res.is_ok());
+                        if let Err(e) = read_res {
+                            log::warn!("[reloc][error] ReadProcessMemory failed: {:?}", e);
+                            return Err(e.into());
+                        }
                         let new_value = original_value.wrapping_add(delta as u64);
-                        unsafe { WriteProcessMemory(process_handle, reloc_addr as *mut _, &new_value as *const _ as *const c_void, 8, None) }?;
+                        let write_res = unsafe { WriteProcessMemory(process_handle, reloc_addr as *mut _, &new_value as *const _ as *const c_void, 8, None) };
+                        log::info!("[reloc] WriteProcessMemory (DIR64): addr=0x{:X}, new_value=0x{:X}, result={:?}", reloc_addr, new_value, write_res.is_ok());
+                        if let Err(e) = write_res {
+                            log::warn!("[reloc][error] WriteProcessMemory failed: {:?}", e);
+                            return Err(e.into());
+                        }
                     },
                     0 => {}, // IMAGE_REL_BASED_ABSOLUTE (skip)
-                    _ => println!("[reloc][warn] Unhandled relocation type: {}", reloc_type),
+                    _ => log::info!("[reloc][warn] Unhandled relocation type: {}", reloc_type),
                 }
             }
             offset += block_size as usize;
@@ -116,11 +139,11 @@ impl PluginApp {
         let pe = PE::parse(dll_data)?;
         for import in &pe.imports {
             let dll_name = import.dll;
-            println!("[hollow/exe] Loading DLL: {}", dll_name);
+            log::info!("Loading DLL: {}", dll_name);
             let h_module = unsafe {
                 GetModuleHandleA(PCSTR(format!("{}\0", dll_name).as_ptr()))
                     .or_else(|_| {
-                        println!("[hollow/exe] DLL not loaded, attempting to load: {}", dll_name);
+                        log::info!("DLL not loaded, attempting to load: {}", dll_name);
                         LoadLibraryA(PCSTR(format!("{}\0", dll_name).as_ptr()))
                     })
             }.map_err(|e| anyhow::anyhow!("Failed to load {}: {}", dll_name, e))?;
@@ -136,7 +159,7 @@ impl PluginApp {
                 }
             };
             if let Some(addr) = func_addr {
-                println!("[hollow/exe] Resolved function at: 0x{:X}", addr as usize);
+                log::info!("Resolved function at: 0x{:X}", addr as usize);
                 unsafe {
                     WriteProcessMemory(
                         process_handle,
@@ -147,7 +170,7 @@ impl PluginApp {
                     ).map_err(|e| anyhow::anyhow!("Failed to write IAT entry: {}", e))?;
                 }
             } else {
-                println!("[hollow/exe] Failed to resolve function, leaving as zero");
+                log::info!("Failed to resolve function, leaving as zero");
             }
         }
         Ok(())
@@ -214,37 +237,37 @@ pub fn set_section_protections(dll_data: &[u8], process_handle: HANDLE, base_add
     let size_of_image = pe.header.optional_header
         .map(|opt| opt.windows_fields.size_of_image as usize)
         .unwrap_or(0);
-    println!("Allocated image range: 0x{:X} - 0x{:X}", base_addr as usize, base_addr as usize + size_of_image);
+    log::info!("Allocated image range: 0x{:X} - 0x{:X}", base_addr as usize, base_addr as usize + size_of_image);
     for (i, section) in pe.sections.iter().enumerate() {
         let name_str = String::from_utf8_lossy(section.name().unwrap_or_default().as_bytes());
         let virtual_address = section.virtual_address as usize;
         let virtual_size = section.virtual_size as usize;
         let raw_size = section.size_of_raw_data as usize;
         let characteristics = section.characteristics;
-        println!("Section {}: name='{}'", i, name_str);
-        println!("  virtual_address=0x{:X}", virtual_address);
-        println!("  virtual_size=0x{:X}", virtual_size);
-        println!("  raw_size=0x{:X}", raw_size);
-        println!("  characteristics=0x{:X}", characteristics);
+        log::info!("Section {}: name='{}'", i, name_str);
+        log::info!("  virtual_address=0x{:X}", virtual_address);
+        log::info!("  virtual_size=0x{:X}", virtual_size);
+        log::info!("  raw_size=0x{:X}", raw_size);
+        log::info!("  characteristics=0x{:X}", characteristics);
         let size = std::cmp::max(virtual_size, raw_size);
         if size == 0 {
-            println!("[protect] Skipping section {}: zero size", i);
+            log::info!("[protect] Skipping section {}: zero size", i);
             continue;
         }
         if virtual_address == 0 {
-            println!("[protect] Skipping section {}: zero virtual address", i);
+            log::info!("[protect] Skipping section {}: zero virtual address", i);
             continue;
         }
         if virtual_address + size > size_of_image {
-            println!("[protect] Skipping section {}: out-of-bounds (addr=0x{:X}, size=0x{:X}, image=0x{:X})", i, virtual_address, size, size_of_image);
+            log::info!("[protect] Skipping section {}: out-of-bounds (addr=0x{:X}, size=0x{:X}, image=0x{:X})", i, virtual_address, size, size_of_image);
             continue;
         }
         if size > 0x1000000 {
-            println!("[protect] Skipping section {}: absurd size (0x{:X})", i, size);
+            log::info!("[protect] Skipping section {}: absurd size (0x{:X})", i, size);
             continue;
         }
         if characteristics & 0x02000000 != 0 {
-            println!("[protect] Skipping section {}: discardable", i);
+            log::info!("[protect] Skipping section {}: discardable", i);
             continue;
         }
         let protection = if characteristics & 0x20000000 != 0 { // IMAGE_SCN_MEM_EXECUTE
@@ -258,10 +281,10 @@ pub fn set_section_protections(dll_data: &[u8], process_handle: HANDLE, base_add
         } else {
             PAGE_READONLY
         };
-        println!("protection: {:X}", protection.0);
+        log::info!("protection: {:X}", protection.0);
         let mut old_protect = PAGE_PROTECTION_FLAGS(0);
         let remote_addr = (base_addr as usize + virtual_address) as *mut _;
-        println!("Calling VirtualProtectEx: addr=0x{:X}, size=0x{:X}, protection=0x{:X}", remote_addr as usize, size, protection.0);
+        log::info!("Calling VirtualProtectEx: addr=0x{:X}, size=0x{:X}, protection=0x{:X}", remote_addr as usize, size, protection.0);
         unsafe {
             VirtualProtectEx(
                 process_handle,

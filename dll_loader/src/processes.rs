@@ -1,11 +1,8 @@
-use std::ffi::c_void;
-
-use sysinfo::ProcessesToUpdate;
 use windows::{core::BOOL, Win32::{Foundation::{FALSE, HANDLE}, Security::{GetSidSubAuthority, GetSidSubAuthorityCount}, System::Threading::{CreateProcessA, OpenProcess, OpenProcessToken, CREATE_SUSPENDED, PROCESS_ALL_ACCESS, PROCESS_INFORMATION, STARTUPINFOA}}};
+use sysinfo::ProcessesToUpdate;
 use windows_strings::PSTR;
-
-use crate::{ExportInfo, PluginApp};
-
+use std::ffi::c_void;
+use crate::*;
 
 impl PluginApp {
     pub fn scan_processes(&mut self) {
@@ -26,7 +23,7 @@ impl PluginApp {
             let path = format!("{}/{}", self.plugin_dir, plugin);
             match Self::get_exports_x64(&path) {
                 Ok(exports) => self.exported_functions = exports,
-                Err(e) => self.load_err.push(format!("Failed to list exports: {e:?}")),
+                Err(e) => log::error!("Failed to list exports: {e:?}"),
             }
         }
     }
@@ -154,56 +151,109 @@ impl PluginApp {
         }
     }
 
-    fn get_exports_x64(file_path: &str) -> anyhow::Result<Vec<ExportInfo>> {
+    pub fn get_exports_x64(file_path: &str) -> anyhow::Result<Vec<ExportInfo>> {
+        use goblin::pe::PE;
         let data = std::fs::read(file_path)?;
-        if data.len() < 64 || u16::from_le_bytes([data[0], data[1]]) != 0x5A4D {
-            return Err(anyhow::anyhow!("Invalid DOS header"));
-        }
+        let pe = PE::parse(&data)?;
+        let opt = pe.header.optional_header.ok_or_else(|| anyhow::anyhow!("Missing optional header"))?;
 
-        let e_lfanew = u32::from_le_bytes(data[0x3C..0x40].try_into()?) as usize;
-        if data.len() < e_lfanew + 4 || &data[e_lfanew..e_lfanew + 4] != b"PE\0\0" {
-            return Err(anyhow::anyhow!("Invalid NT header"));
-        }
+        // Sections
+        let section_info: Vec<SectionInfo> = pe.sections.iter().map(|s| SectionInfo {
+            name: String::from_utf8_lossy(s.name().unwrap_or_default().as_bytes()).to_string(),
+            virtual_address: s.virtual_address as usize,
+            virtual_size: s.virtual_size as usize,
+            raw_size: s.size_of_raw_data as usize,
+            characteristics: s.characteristics,
+        }).collect();
 
-        let optional_header_offset = e_lfanew + 24;
-        let magic = u16::from_le_bytes(data[optional_header_offset..optional_header_offset + 2].try_into()?);
-        if magic != 0x20B {
-            return Err(anyhow::anyhow!("Not 64bit PE"));
-        }
+        // Imports
+        let import_info: Vec<ImportInfo> = pe.imports.iter().map(|imp| ImportInfo {
+            dll: imp.dll.to_string(),
+            functions: if !imp.name.is_empty() { vec![imp.name.to_string()] } else { vec![] },
+        }).collect();
 
-        let export_rva = u32::from_le_bytes(
-            data[optional_header_offset + 0x70..optional_header_offset + 0x74].try_into()?
-        ) as usize;
-        let export_size = u32::from_le_bytes(
-            data[optional_header_offset + 0x74..optional_header_offset + 0x78].try_into()?
-        ) as usize;
-        if export_rva == 0 || export_size == 0 {
-            return Err(anyhow::anyhow!("No export table"));
-        }
+        // Exports
+        let export_info: Vec<ExportFuncInfo> = pe.exports.iter().map(|exp| ExportFuncInfo {
+            name: exp.name.as_ref().map(|s| s.to_string()),
+            rva: exp.rva as usize,
+        }).collect();
 
-        let export_offset = Self::rva_to_offset(&data, export_rva)?;
-
-        let number_of_names = u32::from_le_bytes(data[export_offset + 24..export_offset + 28].try_into()?) as usize;
-        let address_of_names = u32::from_le_bytes(data[export_offset + 32..export_offset + 36].try_into()?) as usize;
-
-        let mut exports = Vec::with_capacity(number_of_names);
-
-        for i in 0..number_of_names {
-            let name_rva_offset = Self::rva_to_offset(&data, address_of_names + i * 4)?;
-            let name_rva = u32::from_le_bytes(data[name_rva_offset..name_rva_offset + 4].try_into()?) as usize;
-
-            if let Ok(name_offset) = Self::rva_to_offset(&data, name_rva) {
-                let len = data[name_offset..].iter().position(|&b| b == 0).unwrap_or(data.len() - name_offset);
-                let name = std::str::from_utf8(&data[name_offset..name_offset + len])?.to_string();
-                exports.push(ExportInfo {
-                    name,
-                    virtual_address: 0, // will be filled later when injected
-                    rva: name_rva,
-                    offset: name_offset,
-                });
+        // TLS: goblin does not parse TLS directly, so we check data directories
+        let tls_info = opt.data_directories.get_tls_table().and_then(|tls_dir| {
+            if tls_dir.virtual_address != 0 {
+                let tls_offset = Self::rva_to_offset(&data, tls_dir.virtual_address as usize).ok()?;
+                // Try to parse TLS structure (simplified)
+                if data.len() >= tls_offset + 40 {
+                    Some(TlsInfo {
+                        start_address_of_raw_data: u64::from_le_bytes(data[tls_offset..tls_offset+8].try_into().ok()?) as usize,
+                        end_address_of_raw_data: u64::from_le_bytes(data[tls_offset+8..tls_offset+16].try_into().ok()?) as usize,
+                        address_of_index: u64::from_le_bytes(data[tls_offset+16..tls_offset+24].try_into().ok()?) as usize,
+                        address_of_callbacks: u64::from_le_bytes(data[tls_offset+24..tls_offset+32].try_into().ok()?) as usize,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
             }
-        }
+        });
 
+        // Main PE metadata
+        let machine = pe.header.coff_header.machine;
+        let number_of_sections = pe.header.coff_header.number_of_sections as usize;
+        let entry_point = opt.standard_fields.address_of_entry_point;
+        let image_base = opt.windows_fields.image_base as usize;
+        let size_of_image = opt.windows_fields.size_of_image as usize;
+        let size_of_headers = opt.windows_fields.size_of_headers as usize;
+        let subsystem = opt.windows_fields.subsystem;
+        let dll_characteristics = opt.windows_fields.dll_characteristics;
+        let timestamp = pe.header.coff_header.time_date_stamp;
+
+        // For each export, create a full ExportInfo
+        let mut exports = Vec::new();
+        for exp in &pe.exports {
+            exports.push(ExportInfo {
+                name: exp.name.as_ref().map(|s| s.to_string()).unwrap_or_default(),
+                virtual_address: image_base + exp.rva as usize,
+                rva: exp.rva as usize,
+                offset: Self::rva_to_offset(&data, exp.rva as usize).unwrap_or(0),
+                machine,
+                number_of_sections,
+                entry_point,
+                image_base,
+                size_of_image,
+                size_of_headers,
+                subsystem,
+                dll_characteristics,
+                timestamp,
+                section_info: section_info.clone(),
+                import_info: import_info.clone(),
+                export_info: export_info.clone(),
+                tls_info: tls_info.clone(),
+            });
+        }
+        // If no exports, still return one with just metadata
+        if exports.is_empty() {
+            exports.push(ExportInfo {
+                name: String::new(),
+                virtual_address: 0,
+                rva: 0,
+                offset: 0,
+                machine,
+                number_of_sections,
+                entry_point,
+                image_base,
+                size_of_image,
+                size_of_headers,
+                subsystem,
+                dll_characteristics,
+                timestamp,
+                section_info,
+                import_info,
+                export_info,
+                tls_info,
+            });
+        }
         Ok(exports)
     }
 

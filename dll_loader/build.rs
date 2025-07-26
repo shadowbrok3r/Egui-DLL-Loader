@@ -6,7 +6,7 @@ fn main() {
         static_vcruntime::metabuild();
         println!("cargo:rerun-if-changed=build.rs");
         println!("cargo rustc -- -Ctarget-feature=+crt-static");
-        // println!("cargo:rustc-link-lib=static=stdc++");
+        // log::info!("cargo:rustc-link-lib=static=stdc++");
         let mut res = winres::WindowsResource::new();
         res.set_manifest(r#"
             <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">

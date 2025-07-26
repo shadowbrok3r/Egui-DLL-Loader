@@ -1,6 +1,5 @@
 use windows::{Win32::{Foundation::*, System::{LibraryLoader::*, Threading::*, Memory::*, Diagnostics::{Debug::*, ToolHelp::*}}}};
 use dll_syringe::{Syringe, process::OwnedProcess};
-use crossbeam::channel::Sender;
 use windows_strings::PCSTR;
 use crate::PluginApp;
 use rand;
@@ -21,7 +20,7 @@ impl PluginApp {
         }
 
         let path = format!("{}\\{}", plugin_dir, plugin);
-        println!("Injecting DLL: {} into PID: {}", path, pid);
+        log::info!("Injecting DLL: {} into PID: {}", path, pid);
         
         if use_thread_hijacking {
             unsafe { Self::inject_via_thread_hijacking(pid, &path, function) }.await
@@ -86,7 +85,7 @@ impl PluginApp {
             ).map_err(|e| {
                 ResumeThread(h_thread);
                 let virt_free_ex = VirtualFreeEx(h_process, path_alloc, 0, MEM_RELEASE);
-                println!("VirtualFreeEx: {virt_free_ex:?}");
+                log::info!("VirtualFreeEx: {virt_free_ex:?}");
                 CloseHandle(h_thread).ok();
                 CloseHandle(h_process).ok();
                 anyhow::anyhow!("WriteProcessMemory failed: {}", e)
@@ -97,7 +96,7 @@ impl PluginApp {
                 .map_err(|e| {
                     ResumeThread(h_thread);
                     let virt_free_ex = VirtualFreeEx(h_process, path_alloc, 0, MEM_RELEASE);
-                    println!("VirtualFreeEx: {virt_free_ex:?}");
+                    log::info!("VirtualFreeEx: {virt_free_ex:?}");
                     CloseHandle(h_thread).ok();
                     CloseHandle(h_process).ok();
                     anyhow::anyhow!("GetModuleHandleA failed: {}", e)
@@ -106,7 +105,7 @@ impl PluginApp {
                 .ok_or_else(|| {
                     ResumeThread(h_thread);
                     let virt_free_ex = VirtualFreeEx(h_process, path_alloc, 0, MEM_RELEASE);
-                    println!("VirtualFreeEx: {virt_free_ex:?}");
+                    log::info!("VirtualFreeEx: {virt_free_ex:?}");
                     CloseHandle(h_thread).ok();
                     CloseHandle(h_process).ok();
                     anyhow::anyhow!("LoadLibraryA not found")
@@ -122,7 +121,7 @@ impl PluginApp {
                 .map_err(|e| {
                     ResumeThread(h_thread);
                     let virt_free_ex = VirtualFreeEx(h_process, path_alloc, 0, MEM_RELEASE);
-                    println!("VirtualFreeEx: {virt_free_ex:?}");
+                    log::info!("VirtualFreeEx: {virt_free_ex:?}");
                     CloseHandle(h_thread).ok();
                     CloseHandle(h_process).ok();
                     anyhow::anyhow!("SetThreadContext failed: {}", e)
@@ -146,7 +145,7 @@ impl PluginApp {
             CloseHandle(h_thread).ok();
             CloseHandle(h_process).ok();
 
-            println!("Thread hijacking injection completed for PID {}", pid.as_u32());
+            log::info!("Thread hijacking injection completed for PID {}", pid.as_u32());
             Ok(())
         }
     }
@@ -197,7 +196,6 @@ impl PluginApp {
         path: String, 
         function: String, 
         pid: u32,
-        tx: Sender<String>
     ) -> anyhow::Result<(), anyhow::Error> {
         unsafe {
             let data = std::fs::read(&path)?;
@@ -230,21 +228,18 @@ impl PluginApp {
             if handle.is_invalid() {
                 return Err(anyhow::anyhow!("CreateRemoteThread failed"));
             }
-            tokio::spawn(async move {
-                tx.send(format!("Called '{}'", function)).ok();
-            });
         }
         Ok(())
     }
 
     pub async unsafe fn inject_dll(pid: sysinfo::Pid, plugin_dir: &str, plugin: &str, function: &str) -> anyhow::Result<(), anyhow::Error> {
         let path = format!("{}\\{}", plugin_dir, plugin);
-        println!("Injecting DLL: {} into PID: {}", path, pid);
+        log::info!("Injecting DLL: {} into PID: {}", path, pid);
         
         let process = OwnedProcess::from_pid(pid.as_u32()).map_err(|e| anyhow::anyhow!("Failed to access process PID {} (access denied - try running as administrator): {}", pid.as_u32(), e))?;
         let syringe = Syringe::for_process(process);
         let injected = syringe.inject(&path).map_err(|e| anyhow::anyhow!("DLL injection failed for {}: {} (ensure DLL exists and is valid)", path, e))?;
-        println!("DLL injected successfully");
+        log::info!("DLL injected successfully");
         
         unsafe {
             let remote_proc = syringe
@@ -252,7 +247,7 @@ impl PluginApp {
                 .map_err(|e| anyhow::anyhow!("Failed to get procedure {}: {}", function, e))?
                 .ok_or(anyhow::anyhow!("Procedure {} not found in DLL", function))?;
             let result = remote_proc.call().map_err(|e| anyhow::anyhow!("Failed to call function {}: {}", function, e))?;
-            println!("{} returned: {}", function, result);
+            log::info!("{} returned: {}", function, result);
         }
         Ok(())
     }
