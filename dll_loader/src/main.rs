@@ -52,7 +52,7 @@ pub struct ExportInfo {
 
 impl PluginApp {
     fn new() -> Self {
-        let default_dir = "target/release".to_string();
+        let default_dir = "../target/release".to_string();
         // let cwd = std::env::current_dir().unwrap_or_default();
         let mut system = System::new_all();
         system.refresh_processes(ProcessesToUpdate::All, true);
@@ -619,20 +619,20 @@ impl eframe::App for PluginApp {
                                             let tx = self.tx.clone();
                                             let pid = pid.as_u32();
                                             // tokio::spawn(async move {
-                                                match unsafe { Self::call_exported_fn(
-                                                    plugin_name,
-                                                    path,
-                                                    function,
-                                                    pid,
-                                                    tx.clone()
-                                                ) } {
-                                                    Ok(_) => {
-                                                        let _ = tx.try_send(format!("Called Exported Fn"));
-                                                    },
-                                                    Err(e) => {
-                                                        let _ = tx.try_send(e.to_string());
-                                                    },
-                                                }
+                                                // match unsafe { Self::call_exported_fn(
+                                                //     plugin_name,
+                                                //     path,
+                                                //     function,
+                                                //     pid,
+                                                //     tx.clone()
+                                                // ) } {
+                                                //     Ok(_) => {
+                                                //         let _ = tx.try_send(format!("Called Exported Fn"));
+                                                //     },
+                                                //     Err(e) => {
+                                                //         let _ = tx.try_send(e.to_string());
+                                                //     },
+                                                // }
                                             // });
                                         } else {
                                             self.open_warning_modal = true;
