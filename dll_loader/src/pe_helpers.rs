@@ -78,7 +78,7 @@ impl PluginApp {
             let block_size = u32::from_le_bytes(pe_data[offset + 4..offset + 8].try_into()?);
             if block_size == 0 { break; }
             let entries_count = (block_size as usize - 8) / 2;
-            log::info!("[reloc] Block: page_rva=0x{:X}, block_size=0x{:X}, entries={}", page_rva, block_size, entries_count);
+            log::debug!("[reloc] Block: page_rva=0x{:X}, block_size=0x{:X}, entries={}", page_rva, block_size, entries_count);
             for i in 0..entries_count {
                 let entry_offset = offset + 8 + i * 2;
                 let entry = u16::from_le_bytes(pe_data[entry_offset..entry_offset + 2].try_into()?);
@@ -87,7 +87,7 @@ impl PluginApp {
                 let reloc_addr = new_base + page_rva as usize + offset_in_page as usize;
                 // Bounds check: skip if reloc_addr is outside the mapped image
                 let in_bounds = reloc_addr >= new_base && reloc_addr + 8 <= new_base + image_size;
-                log::info!("[reloc] Entry {}: type={}, offset_in_page=0x{:X}, reloc_addr=0x{:X}, in_bounds={}", i, reloc_type, offset_in_page, reloc_addr, in_bounds);
+                log::debug!("[reloc] Entry {}: type={}, offset_in_page=0x{:X}, reloc_addr=0x{:X}, in_bounds={}", i, reloc_type, offset_in_page, reloc_addr, in_bounds);
                 if !in_bounds {
                     log::warn!("[reloc][warn] Skipping relocation: address 0x{:X} out of bounds (image base=0x{:X}, size=0x{:X})", reloc_addr, new_base, image_size);
                     continue;
@@ -96,14 +96,14 @@ impl PluginApp {
                     3 => { // IMAGE_REL_BASED_HIGHLOW (32-bit)
                         let mut original_value = 0u32;
                         let read_res = unsafe { ReadProcessMemory(process_handle, reloc_addr as *const _, &mut original_value as *mut _ as *mut c_void, 4, None) };
-                        log::info!("[reloc] ReadProcessMemory (HIGHLOW): addr=0x{:X}, value=0x{:X}, result={:?}", reloc_addr, original_value, read_res.is_ok());
+                        log::debug!("[reloc] ReadProcessMemory (HIGHLOW): addr=0x{:X}, value=0x{:X}, result={:?}", reloc_addr, original_value, read_res.is_ok());
                         if let Err(e) = read_res {
                             log::warn!("[reloc][error] ReadProcessMemory failed: {:?}", e);
                             return Err(e.into());
                         }
                         let new_value = original_value.wrapping_add(delta as u32);
                         let write_res = unsafe { WriteProcessMemory(process_handle, reloc_addr as *mut _, &new_value as *const _ as *const c_void, 4, None) };
-                        log::info!("[reloc] WriteProcessMemory (HIGHLOW): addr=0x{:X}, new_value=0x{:X}, result={:?}", reloc_addr, new_value, write_res.is_ok());
+                        log::debug!("[reloc] WriteProcessMemory (HIGHLOW): addr=0x{:X}, new_value=0x{:X}, result={:?}", reloc_addr, new_value, write_res.is_ok());
                         if let Err(e) = write_res {
                             log::warn!("[reloc][error] WriteProcessMemory failed: {:?}", e);
                             return Err(e.into());
@@ -112,21 +112,21 @@ impl PluginApp {
                     10 => { // IMAGE_REL_BASED_DIR64 (64-bit)
                         let mut original_value = 0u64;
                         let read_res = unsafe { ReadProcessMemory(process_handle, reloc_addr as *const _, &mut original_value as *mut _ as *mut c_void, 8, None) };
-                        log::info!("[reloc] ReadProcessMemory (DIR64): addr=0x{:X}, value=0x{:X}, result={:?}", reloc_addr, original_value, read_res.is_ok());
+                        log::debug!("[reloc] ReadProcessMemory (DIR64): addr=0x{:X}, value=0x{:X}, result={:?}", reloc_addr, original_value, read_res.is_ok());
                         if let Err(e) = read_res {
                             log::warn!("[reloc][error] ReadProcessMemory failed: {:?}", e);
                             return Err(e.into());
                         }
                         let new_value = original_value.wrapping_add(delta as u64);
                         let write_res = unsafe { WriteProcessMemory(process_handle, reloc_addr as *mut _, &new_value as *const _ as *const c_void, 8, None) };
-                        log::info!("[reloc] WriteProcessMemory (DIR64): addr=0x{:X}, new_value=0x{:X}, result={:?}", reloc_addr, new_value, write_res.is_ok());
+                        log::debug!("[reloc] WriteProcessMemory (DIR64): addr=0x{:X}, new_value=0x{:X}, result={:?}", reloc_addr, new_value, write_res.is_ok());
                         if let Err(e) = write_res {
                             log::warn!("[reloc][error] WriteProcessMemory failed: {:?}", e);
                             return Err(e.into());
                         }
                     },
                     0 => {}, // IMAGE_REL_BASED_ABSOLUTE (skip)
-                    _ => log::info!("[reloc][warn] Unhandled relocation type: {}", reloc_type),
+                    _ => log::warn!("[reloc][warn] Unhandled relocation type: {}", reloc_type),
                 }
             }
             offset += block_size as usize;
@@ -139,11 +139,11 @@ impl PluginApp {
         let pe = PE::parse(dll_data)?;
         for import in &pe.imports {
             let dll_name = import.dll;
-            log::info!("Loading DLL: {}", dll_name);
+            log::debug!("Loading DLL: {}", dll_name);
             let h_module = unsafe {
                 GetModuleHandleA(PCSTR(format!("{}\0", dll_name).as_ptr()))
                     .or_else(|_| {
-                        log::info!("DLL not loaded, attempting to load: {}", dll_name);
+                        log::debug!("DLL not loaded, attempting to load: {}", dll_name);
                         LoadLibraryA(PCSTR(format!("{}\0", dll_name).as_ptr()))
                     })
             }.map_err(|e| anyhow::anyhow!("Failed to load {}: {}", dll_name, e))?;
@@ -159,7 +159,7 @@ impl PluginApp {
                 }
             };
             if let Some(addr) = func_addr {
-                log::info!("Resolved function at: 0x{:X}", addr as usize);
+                log::debug!("Resolved function at: 0x{:X}", addr as usize);
                 unsafe {
                     WriteProcessMemory(
                         process_handle,
@@ -170,7 +170,7 @@ impl PluginApp {
                     ).map_err(|e| anyhow::anyhow!("Failed to write IAT entry: {}", e))?;
                 }
             } else {
-                log::info!("Failed to resolve function, leaving as zero");
+                log::debug!("Failed to resolve function, leaving as zero");
             }
         }
         Ok(())
