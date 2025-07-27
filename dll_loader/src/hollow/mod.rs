@@ -216,11 +216,30 @@ impl PluginApp {
             return Err(e);
         }
 
-        // 12. Set thread context to new entry point
+        // 12. Set all sections and PE header to PAGE_EXECUTE_READWRITE before resuming the thread
+        log::info!("Setting all sections and PE header to PAGE_EXECUTE_READWRITE before resume...");
+        for section in pe.sections.iter() {
+            let dest = (new_base + section.virtual_address as usize) as *mut c_void;
+            let size = std::cmp::max(section.virtual_size, section.size_of_raw_data) as usize;
+            if size > 0 {
+                let mut old_protect = PAGE_PROTECTION_FLAGS(0);
+                if let Err(e) = unsafe { VirtualProtectEx(h_process, dest, size, PAGE_EXECUTE_READWRITE, &mut old_protect) } {
+                    log::warn!("Failed to set PAGE_EXECUTE_READWRITE for section {}: {:?}", String::from_utf8_lossy(section.name().unwrap_or_default().as_bytes()), e);
+                }
+            }
+        }
+        // Set PE header to PAGE_EXECUTE_READWRITE
+        let mut old_protect_header = PAGE_PROTECTION_FLAGS(0);
+        if let Err(e) = unsafe { VirtualProtectEx(h_process, new_base as *mut c_void, size_of_headers, PAGE_EXECUTE_READWRITE, &mut old_protect_header) } {
+            log::warn!("Failed to set PAGE_EXECUTE_READWRITE for PE header: {:?}", e);
+        }
+        unsafe { FlushInstructionCache(h_process, None, 0)? };
+        log::info!("Instruction cache flushed before resume.");
+
+        // 13. Set thread context to new entry point
         let mut context = CONTEXT::default();
         context.ContextFlags = CONTEXT_ALL_AMD64;
         unsafe { GetThreadContext(h_thread, &mut context)? };
-
         #[cfg(target_arch = "x86_64")]
         {
             context.Rip = new_base as u64 + entry_rva as u64;
@@ -237,7 +256,7 @@ impl PluginApp {
             return Err(anyhow::anyhow!("SetThreadContext failed: {e:?}"));
         }
 
-        // 13. Resume thread
+        // 14. Resume thread
         log::info!("Resuming main thread...");
         let resume_count = unsafe { ResumeThread(h_thread) };
         if resume_count == u32::MAX {
@@ -247,9 +266,9 @@ impl PluginApp {
         }
         log::info!("ResumeThread returned: {}", resume_count);
 
-        // 14. Restore final protections after a short delay to allow TLS callbacks to run
+        // 15. After a short delay, set final protections
         std::thread::sleep(std::time::Duration::from_millis(200));
-        log::info!("Restoring final section protections after delay...");
+        log::info!("Setting final section protections after delay...");
         for section in pe.sections.iter() {
             let dest = (new_base + section.virtual_address as usize) as *mut c_void;
             let size = std::cmp::max(section.virtual_size, section.size_of_raw_data) as usize;
@@ -266,21 +285,21 @@ impl PluginApp {
                 } else if characteristics & 0x40000000 != 0 { // READ
                     PAGE_READONLY
                 } else {
-                    PAGE_NOACCESS // Should not happen for loaded sections
+                    PAGE_NOACCESS
                 };
                 let mut old_protect = PAGE_PROTECTION_FLAGS(0);
                 if let Err(e) = unsafe { VirtualProtectEx(h_process, dest, size, protection, &mut old_protect) } {
-                    log::warn!("Failed to restore protection for section {}: {:?}", String::from_utf8_lossy(section.name().unwrap_or_default().as_bytes()), e);
+                    log::warn!("Failed to set final protection for section {}: {:?}", String::from_utf8_lossy(section.name().unwrap_or_default().as_bytes()), e);
                 }
             }
         }
-
-        // Restore protection on the PE header itself
-        log::info!("Restoring PE header protection to READONLY...");
+        // Set PE header to READONLY
         let mut old_protect_header = PAGE_PROTECTION_FLAGS(0);
         if let Err(e) = unsafe { VirtualProtectEx(h_process, new_base as *mut c_void, size_of_headers, PAGE_READONLY, &mut old_protect_header) } {
-            log::warn!("Failed to restore protection for PE header: {:?}", e);
+            log::warn!("Failed to set final protection for PE header: {:?}", e);
         }
+        unsafe { FlushInstructionCache(h_process, None, 0)? };
+        log::info!("Instruction cache flushed after final protections.");
 
         log::info!("Hollowing complete. New process PID: {}", process_info.dwProcessId);
 
