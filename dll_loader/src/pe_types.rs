@@ -1,4 +1,4 @@
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ExportInfo {
     pub name: String,
     pub virtual_address: usize,

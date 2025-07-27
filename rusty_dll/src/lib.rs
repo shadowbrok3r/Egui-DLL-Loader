@@ -91,12 +91,8 @@ pub extern "system" fn DllMain(_hinst: *mut (), _reason: u32, _reserved: *mut ()
         );
     }
     return 1;
-fn log_to_file(msg: &str) {
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("C:\\temp\\dll_log.txt") {
-        let _ = writeln!(file, "{}", msg);
-    }
 }
-}
+
 
 #[unsafe(no_mangle)]
 pub extern "C" fn init() {

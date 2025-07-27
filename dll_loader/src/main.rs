@@ -5,7 +5,6 @@ pub mod pe_types;
 pub mod inject;
 pub mod hollow;
 pub mod ui;
-
 pub use pe_types::*;
 
 pub struct PluginApp {
@@ -71,7 +70,7 @@ impl PluginApp {
             pid_tx, pid_rx,
             exported_functions: Vec::new(),
             selected_function: None,
-            process_to_hollow: "C:\\Windows\\notepad.exe".to_string(),
+            process_to_hollow: "C:\\Windows\\System32\\bcdedit.exe".to_string(),
             process_to_hollow_file_dialog: egui_file_dialog::FileDialog::new()
                 .show_hidden_option(true)
                 .initial_directory("C:\\".into())
@@ -128,7 +127,10 @@ async fn main() -> eframe::Result<()> {
     .init();
 
     let app = PluginApp::new();
-    let native_options = eframe::NativeOptions::default();
+    let native_options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1000., 700.]),
+        ..Default::default()
+    };
     eframe::run_native(
         "DLL Injector",
         native_options,

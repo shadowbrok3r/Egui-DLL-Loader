@@ -73,7 +73,10 @@ impl crate::PluginApp {
                                     let _ = pid_tx.send(sysinfo::Pid::from_u32(pid));
                                     log::info!("Successfully hollowed process with EXE '{plugin}' (PID: {pid})");
                                 },
-                                Err(e) => log::error!("Process hollowing with EXE failed: {e}")
+                                Err(e) => {
+                                    log::error!("Win32: {}", unsafe { windows::Win32::Foundation::GetLastError().to_hresult().message() });
+                                    log::error!("Process hollowing with EXE failed: {e}");
+                                }
                             }
                         });
                     }
@@ -81,40 +84,6 @@ impl crate::PluginApp {
                 } else { self.open_warning_modal = true; }
             }
             ui.add_space(5.);
-            if ui.button(RichText::new("Hollow Process 3").color(Color32::LIGHT_BLUE)).clicked() {
-                if let Some(plugin) = &self.selected_plugin {
-                    let exe_path = self.process_to_hollow.clone();
-                    if exe_path.is_empty() { self.open_warning_modal = true; }
-                    let plugin_dir = self.plugin_dir.clone();
-                    let plugin = plugin.clone();
-                    let pid_tx = self.pid_tx.clone();
-
-                    if plugin.ends_with("exe") {
-                        std::thread::spawn(move || {
-                            use std::fs;
-                            let exe_path = exe_path.clone();
-                            let plugin_path = format!("{}\\{}", plugin_dir, plugin);
-                            log::info!("Reading {plugin_path}");
-                            let pe_data = match fs::read(&plugin_path) {
-                                Ok(d) => d,
-                                Err(e) => {
-                                    log::error!("Failed to read EXE: {e}");
-                                    return;
-                                }
-                            };
-
-                            match unsafe { crate::PluginApp::hollow_process_with_exe3(&pe_data, &exe_path) } {
-                                Ok(pid) => {
-                                    let _ = pid_tx.send(sysinfo::Pid::from_u32(pid));
-                                    log::info!("Successfully hollowed process with EXE '{plugin}' (PID: {pid})");
-                                },
-                                Err(e) => log::error!("Process hollowing with EXE failed: {e}")
-                            }
-                        });
-                    }
-                    
-                } else { self.open_warning_modal = true; }
-            }
 
             if ui.button(RichText::new("Hollow Process Original").color(Color32::LIGHT_BLUE)).clicked() {
                 if let Some(plugin) = &self.selected_plugin {
@@ -143,7 +112,10 @@ impl crate::PluginApp {
                                     let _ = pid_tx.send(sysinfo::Pid::from_u32(pid));
                                     log::info!("Successfully hollowed process with EXE '{plugin}' (PID: {pid})");
                                 },
-                                Err(e) => log::error!("Process hollowing with EXE failed: {e}")
+                                Err(e) => {
+                                    log::error!("Win32: {}", unsafe { windows::Win32::Foundation::GetLastError().to_hresult().message() });
+                                    log::error!("Process hollowing with EXE failed: {e}");
+                                }
                             }
                         });
                     }

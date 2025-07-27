@@ -30,7 +30,7 @@ impl PluginApp {
                 {
                     ui.horizontal(|ui| {
                         ui.colored_label(ui.style().visuals.error_fg_color, format!("{}", pid.as_u32()));
-                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui.button("⮫").clicked() {
                                 let plugs = self.selected_plugin.clone();
                                 let plugin_dir = self.plugin_dir.clone();
@@ -114,7 +114,7 @@ impl PluginApp {
                             if ui.radio_value(&mut self.selected_function, Some(export.name.clone()), RichText::new(&export.name).color(Color32::LIGHT_GREEN)).clicked() {
                                 log::error!("Selected Function: {}", export.name);
                             }
-                            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if export.virtual_address > 0 {
                                     ui.label(format!("{:#X}", export.virtual_address));
                                     ui.colored_label(Color32::LIGHT_GREEN, "Virtual Addr:");
