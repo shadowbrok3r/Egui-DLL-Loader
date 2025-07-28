@@ -18,7 +18,11 @@ impl eframe::App for crate::PluginApp {
             };
         }
         
-        while let Ok(pid) = self.pid_rx.try_recv() {
+        if let Ok(diag_info) = self.diagnostics_rx.try_recv() {
+            self.diag_info = diag_info;
+        }
+
+        if let Ok(pid) = self.pid_rx.try_recv() {
             log::info!("Got PID: {pid:?}");
             self.target_pid = Some(pid);
         }
@@ -107,6 +111,103 @@ impl crate::PluginApp {
     }
 
     pub fn warning_modal(&mut self, ctx: &Context) {
+
+        Window::new("Changes")
+            .open(&mut self.open_diag_window)
+            .show(ctx, |ui| {
+                let diag_info = &self.diag_info;
+                ScrollArea::vertical().show(ui, |ui| {
+                    ui.vertical_centered(|ui| ui.heading("Process Hollowing Diagnostics"));
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Base Address: 0x{:X}", diag_info.base_address_before));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(format!("0x{:X}", diag_info.base_address_after));
+                        });
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Entry Point RVA: 0x{:X}", diag_info.entry_point_rva_before));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(format!("0x{:X}", diag_info.entry_point_rva_after));
+                        });
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label(format!("RIP: 0x{:X}", diag_info.rip_before));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(format!("0x{:X}", diag_info.rip_after));
+                        });
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label(format!("RSP: 0x{:X}", diag_info.rsp_before));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(format!("0x{:X}", diag_info.rsp_after));
+                        });
+                    });
+
+
+                    ui.horizontal(|ui| {
+                        ui.label(format!("RBP: 0x{:X}", diag_info.rbp_before));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(format!("0x{:X}", diag_info.rbp_after));
+                        });
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label(format!("TLS Directory RVA: 0x{:X}", diag_info.tls_rva_before));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(format!("0x{:X}", diag_info.tls_rva_after));
+                        });
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label(format!("TLS Directory Size: 0x{:X}", diag_info.tls_size_before));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(format!("0x{:X}", diag_info.tls_size_after));
+                        });
+                    });
+                    
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Relocation Table RVA: 0x{:X}", diag_info.reloc_rva_before));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(format!("0x{:X}", diag_info.reloc_rva_after));
+                        });
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Relocation Table Size: 0x{:X}", diag_info.reloc_size_before));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(format!("0x{:X}", diag_info.reloc_size_after));
+                        });
+                    });
+                    
+                    ui.separator();
+                    ui.heading("Sections");
+                    ui.columns(7, |cols| {
+                        cols[0].label("Name");
+                        cols[1].label("RVA");
+                        cols[2].label("RawPtr");
+                        cols[3].label("RawSize");
+                        cols[4].label("VirtSize");
+                        cols[5].label("Characteristics");
+                        cols[6].label("Protection");
+                    });
+                    for (name, rva, raw_ptr, raw_size, virt_size, characteristics, protection) in &diag_info.sections {
+                        ui.columns(7, |cols| {
+                            cols[0].label(name);
+                            cols[1].label(format!("0x{:X}", rva));
+                            cols[2].label(format!("0x{:X}", raw_ptr));
+                            cols[3].label(format!("0x{:X}", raw_size));
+                            cols[4].label(format!("0x{:X}", virt_size));
+                            cols[5].label(format!("0x{:X}", characteristics));
+                            cols[6].label(*protection);
+                        });
+                    }
+                });
+            });
+            
         if self.open_warning_modal {
             let modal = Modal::new(Id::new("Missing selected function modal"))
             .show(ctx, |ui| {

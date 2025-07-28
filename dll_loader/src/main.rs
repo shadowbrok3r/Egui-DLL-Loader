@@ -7,6 +7,8 @@ pub mod hollow;
 pub mod ui;
 pub use pe_types::*;
 
+use crate::hollow::diagnostics::HollowDiagnostics;
+
 pub struct PluginApp {
     pub plugin_dir: String,
     pub plugins: Vec<String>,
@@ -16,6 +18,8 @@ pub struct PluginApp {
     pub system: sysinfo::System,
     pub pid_tx: crossbeam::channel::Sender<sysinfo::Pid>,
     pub pid_rx: crossbeam::channel::Receiver<sysinfo::Pid>,
+    pub diagnostics_tx: crossbeam::channel::Sender<HollowDiagnostics>,
+    pub diagnostics_rx: crossbeam::channel::Receiver<HollowDiagnostics>,
     pub exported_functions: Vec<pe_types::ExportInfo>,
     pub selected_function: Option<String>,
     pub process_to_hollow: String,
@@ -28,6 +32,8 @@ pub struct PluginApp {
     open_log_window: bool,
     evasion_mode: bool,
     thread_hijack_mode: bool,
+    diag_info: HollowDiagnostics,
+    open_diag_window: bool,
 }
 
 impl PluginApp {
@@ -58,14 +64,18 @@ impl PluginApp {
         }
 
         let (pid_tx, pid_rx) = crossbeam::channel::unbounded();
+        let (diagnostics_tx, diagnostics_rx) = crossbeam::channel::unbounded();
 
         Self {
+            diag_info: HollowDiagnostics::default(),
             plugin_dir: default_dir,
             selected_plugin: None,
             open_log_window: false,
+            open_diag_window: false,
             plugins,
             processes,
             system,
+            diagnostics_tx, diagnostics_rx,
             target_pid: None,
             pid_tx, pid_rx,
             exported_functions: Vec::new(),

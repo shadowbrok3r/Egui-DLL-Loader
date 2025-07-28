@@ -1,0 +1,22 @@
+#[derive(Debug, Clone, Default)]
+pub struct HollowDiagnostics {
+    pub base_address_before: usize,
+    pub base_address_after: usize,
+    pub entry_point_rva_before: u32,
+    pub entry_point_rva_after: u32,
+    pub rip_before: u64,
+    pub rip_after: u64,
+    pub rsp_before: u64,
+    pub rsp_after: u64,
+    pub rbp_before: u64,
+    pub rbp_after: u64,
+    pub tls_rva_before: u32,
+    pub tls_rva_after: u32,
+    pub tls_size_before: u32,
+    pub tls_size_after: u32,
+    pub reloc_rva_before: u32,
+    pub reloc_rva_after: u32,
+    pub reloc_size_before: u32,
+    pub reloc_size_after: u32,
+    pub sections: Vec<(String, u32, u32, u32, u32, u32, &'static str)>,
+}

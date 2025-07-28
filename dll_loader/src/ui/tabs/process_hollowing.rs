@@ -14,12 +14,13 @@ impl crate::PluginApp {
 
             if ui.button(RichText::new("Hollow Process 2").color(Color32::LIGHT_RED)).clicked() {
                 if let Some(plugin) = &self.selected_plugin {
+                    self.open_diag_window = true;
                     let exe_path = self.process_to_hollow.clone();
                     if exe_path.is_empty() { self.open_warning_modal = true; }
                     let plugin_dir = self.plugin_dir.clone();
                     let plugin = plugin.clone();
                     let pid_tx = self.pid_tx.clone();
-
+                    let diag_tx = self.diagnostics_tx.clone();
                     if let Some(function) = &self.selected_function && plugin.ends_with("dll") {
                         let function = function.clone();
                         std::thread::spawn(move || {
@@ -55,7 +56,7 @@ impl crate::PluginApp {
                             }
                         });
                     } else if plugin.ends_with("exe") {
-                        std::thread::spawn(move || {
+                        // std::thread::spawn(move || {
                             use std::fs;
                             let exe_path = exe_path.clone();
                             let plugin_path = format!("{}\\{}", plugin_dir, plugin);
@@ -68,7 +69,11 @@ impl crate::PluginApp {
                                 }
                             };
 
-                            match unsafe { crate::PluginApp::hollow_process_with_exe2(&pe_data, &exe_path) } {
+                            match unsafe { crate::PluginApp::hollow_process_with_exe2(
+                                &pe_data, 
+                                &exe_path, 
+                                &diag_tx
+                            ) } {
                                 Ok(pid) => {
                                     let _ = pid_tx.send(sysinfo::Pid::from_u32(pid));
                                     log::info!("Successfully hollowed process with EXE '{plugin}' (PID: {pid})");
@@ -78,7 +83,7 @@ impl crate::PluginApp {
                                     log::error!("Process hollowing with EXE failed: {e}");
                                 }
                             }
-                        });
+                        // });
                     }
                     
                 } else { self.open_warning_modal = true; }
