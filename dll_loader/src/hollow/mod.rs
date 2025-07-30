@@ -1,10 +1,185 @@
 use windows::{core::BOOL, Win32::{Foundation::*, Security::{AdjustTokenPrivileges, LookupPrivilegeValueA, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY}, System::{Diagnostics::Debug::*, LibraryLoader::*, Memory::*, Threading::*}}};
 use windows::Wdk::System::{Memory::NtUnmapViewOfSection, Threading::NtQueryInformationProcess};
-use crate::{hollow::diagnostics::HollowDiagnostics, PluginApp};
 use windows_strings::{s, PCSTR, PSTR};
 use std::ffi::c_void;
+use anyhow::Context;
+use crate::*;
 
 pub mod diagnostics;
+
+// Offsets in LDR_DATA_TABLE_ENTRY (x64, Win10+)
+const DLL_BASE_OFF:       usize = 0x30;
+const ENTRY_POINT_OFF:    usize = 0x38;
+const SIZE_OF_IMAGE_OFF:  usize = 0x40;
+
+fn dump_first_ldr_entry(h_proc: HANDLE, peb_addr: *const c_void) -> anyhow::Result<()> {
+    let mut ldr_ptr: u64 = 0;
+    // PEB +0x18 -> Ldr
+    read_remote(h_proc, peb_addr as usize + 0x18, &mut ldr_ptr)?;
+
+    // first entry = *(Ldr + 0x10)
+    let mut first_entry: u64 = 0;
+    read_remote(h_proc, ldr_ptr as usize + 0x10, &mut first_entry)?;
+
+    let mut dll_base: u64 = 0;
+    let mut size_img: u32 = 0;
+    let mut entry_pt : u64 = 0;
+
+    unsafe {
+        ReadProcessMemory(
+            h_proc, 
+            (first_entry as usize + DLL_BASE_OFF)  as _,
+            &mut dll_base as *mut _ as _, 
+            8, 
+            None
+        ).context("ReadProcessMemory dll_base")?;
+        ReadProcessMemory(
+            h_proc, 
+            (first_entry as usize + SIZE_OF_IMAGE_OFF) as _,
+            &mut size_img as *mut _ as _, 
+            4, 
+            None
+        ).context("ReadProcessMemory size_img")?;
+        ReadProcessMemory(
+            h_proc, 
+            (first_entry as usize + ENTRY_POINT_OFF) as _,
+            &mut entry_pt as *mut _ as _, 
+            8, 
+            None
+        ).context("ReadProcessMemory entry_pt")?;
+    }
+
+    log::warn!("--- First LDR entry dump ---");
+    log::warn!("  DllBase      = 0x{:X}", dll_base);
+    log::warn!("  SizeOfImage  = 0x{:X}", size_img);
+    log::warn!("  EntryPoint   = 0x{:X}", entry_pt);
+    Ok(())
+}
+
+/// read exactly sizeof(T) bytes; treat ERROR_PARTIAL_COPY as success
+unsafe fn rpm_exact<T: Default + Copy>(
+    h_proc: HANDLE,
+    remote: usize,
+    out: &mut T,
+) -> anyhow::Result<()> {
+    let mut read = 0usize;
+    // ReadProcessMemory returns BOOL inside WinResult<()>
+    let status = unsafe { ReadProcessMemory(
+        h_proc,
+        remote as _,
+        out as *mut _ as _,
+        std::mem::size_of::<T>(),
+        Some(&mut read),
+    ) };
+
+    log::error!("Status: {status:?}");
+    // success if we obtained all bytes
+    if read == std::mem::size_of::<T>() {
+        return Ok(());
+    }
+
+    // otherwise bubble up a detailed error
+    let gle = unsafe { GetLastError() };
+    Err(anyhow::anyhow!(
+        "RPM 0x{:X} wanted {} got {}  (GLE = 0x{:X})",
+                        remote,
+                        std::mem::size_of::<T>(),
+                        read,
+                        gle.0
+    ))
+}
+
+fn read_remote<T: Default + Copy>(
+    h: HANDLE,
+    addr: usize,
+    out: &mut T,
+) -> anyhow::Result<()> {
+    let mut read = 0usize;
+    unsafe {
+        let ok = ReadProcessMemory(
+            h,
+            addr as _,
+            out as *mut _ as _,
+            std::mem::size_of::<T>(),
+                                   Some(&mut read),
+        )
+        .is_ok();
+
+        if !ok || read != std::mem::size_of::<T>() {
+            return Err(anyhow::anyhow!(
+                "RPM 0x{:X} wanted {} got {} (gle={})",
+                                       addr,
+                                       std::mem::size_of::<T>(),
+                                       read,
+                                       GetLastError().0
+            ));
+        }
+    }
+    Ok(())
+}
+
+
+fn fix_ldr_entry(h_proc: HANDLE, peb_addr: *const PEB, new_base: usize, size_of_img: usize, entry_rva: u32) -> anyhow::Result<()> {
+
+    // 1. PEB->Ldr
+    let mut ldr_ptr: u64 = 0;
+    unsafe {
+        rpm_exact(
+            h_proc,
+            peb_addr as usize + 0x18,   // PEB.Ldr
+            &mut ldr_ptr,
+        )?;
+    }
+
+    // 2. first LIST_ENTRY in InLoadOrder list (main exe)
+    let mut first_entry: u64 = 0;
+    unsafe {
+        rpm_exact(
+            h_proc,
+            ldr_ptr as usize + 0x10,    // Ldr.InLoadOrderModuleList.Flink
+            &mut first_entry,
+        )?;
+    }
+
+    // 3. patch DllBase, SizeOfImage, EntryPoint
+    let dll_base_field  = first_entry + DLL_BASE_OFF  as u64;
+    let size_field      = first_entry + SIZE_OF_IMAGE_OFF as u64;
+    let ep_field        = first_entry + ENTRY_POINT_OFF as u64;
+
+    let size32 = size_of_img as u32;
+    let new_ep = new_base + entry_rva as usize;
+
+    unsafe {
+        WriteProcessMemory(
+            h_proc, 
+            dll_base_field as _, 
+            &new_base as *const _ as _, 
+            8, 
+            None
+        ).context("WriteProcessMemory dll_base_field")?;
+
+        WriteProcessMemory(
+            h_proc, 
+            size_field as _, 
+            &size32 as *const _ as _, 
+            4, 
+            None
+        ).context("WriteProcessMemory size_field")?;
+
+        WriteProcessMemory(
+            h_proc, 
+            ep_field as _, 
+            &new_ep as *const _ as _, 
+            8, 
+            None
+        ).context("WriteProcessMemory ep_field")?;
+
+    }
+
+    log::warn!("LDR entry fixed (DllBase=0x{:X}, Size=0x{:X})", new_base, size_of_img);
+    Ok(())
+}
+
 
 impl PluginApp {
     /// A corrected and robust implementation of process hollowing for EXEs.
@@ -51,7 +226,8 @@ impl PluginApp {
                 None,
                 &startup_info,
                 &mut process_info,
-            )?
+            )?;
+            log::warn!("CreateProcessA Win32: {}", GetLastError().to_hresult().message() );
         };
         log::info!("Suspended process created. PID: {}", process_info.dwProcessId);
 
@@ -63,7 +239,8 @@ impl PluginApp {
         if let Err(e) = unsafe { GetThreadContext(h_thread, &mut context) } {
             log::error!("GetThreadContext failed: {:?}", unsafe { windows::Win32::Foundation::GetLastError().to_hresult().message() });
             return Err(anyhow::anyhow!("GetThreadContext failed: {:?}", e));
-        }
+        } 
+        log::info!("GetThreadContext Win32: {}", unsafe { GetLastError().to_hresult().message() });
 
         // Log original RSP and RBP
         let original_rsp = context.Rsp;
@@ -72,24 +249,35 @@ impl PluginApp {
         hollow_diagnostics.rbp_before = original_rbp;
         let original_rip = context.Rip;
         hollow_diagnostics.rip_before = original_rip;
+
+        // --- Remote PE diagnostics BEFORE hollowing ---
+        let base_addr_before = get_remote_base_address(process_info.dwProcessId).unwrap_or(0);
+        hollow_diagnostics.base_address_before = base_addr_before;
+        hollow_diagnostics.sections_before = get_remote_sections(h_process, base_addr_before).ok().flatten();
+        hollow_diagnostics.imports_before = get_remote_imports(h_process, base_addr_before).ok().flatten();
+        hollow_diagnostics.exports_before = get_remote_exports(h_process, base_addr_before).ok().flatten();
+        hollow_diagnostics.tls_callbacks_before = get_remote_tls_callbacks(h_process, base_addr_before).ok().flatten();
+        hollow_diagnostics.reloc_blocks_before = get_remote_relocations(h_process, base_addr_before).ok().flatten();
         let _ = diag_sender.try_send(hollow_diagnostics.clone());
-        
         log::info!("Original RIP: 0x{:X}\nOriginal RSP: 0x{:X}\nOriginal RBP: 0x{:X}", original_rip, original_rsp, original_rbp);
 
         // 2. Get the PEB address and image base address
         let mut pbi = PROCESS_BASIC_INFORMATION::default();
         let status = unsafe {
+            let mut ret_len = 0u32;
             NtQueryInformationProcess(
                 h_process,
                 windows::Wdk::System::Threading::PROCESSINFOCLASS(0),
                 &mut pbi as *mut _ as *mut c_void,
                 std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32,
-                std::ptr::null_mut(),
+                &mut ret_len,
             )
         };
+        log::info!("NtQueryInformationProcess Win32: {}", unsafe { GetLastError().to_hresult().message() });
         if !status.is_ok() {
             return Err(anyhow::anyhow!("NtQueryInformationProcess failed with status: {:?}", status));
         }
+        
         log::info!("Remote PEB at: {:?}", pbi.PebBaseAddress);
 
         let image_base_addr_ptr = (pbi.PebBaseAddress as usize + 0x10) as *mut c_void;
@@ -103,11 +291,13 @@ impl PluginApp {
                 None,
             )?
         };
+        log::info!("ReadProcessMemory Win32: {}", unsafe { GetLastError().to_hresult().message() });
         let remote_image_base = usize::from_le_bytes(remote_image_base_buf);
         log::info!("Original image base: 0x{:X}", remote_image_base);
 
         // 3. Unmap the original executable
         let status = unsafe { NtUnmapViewOfSection(h_process, Some(remote_image_base as *mut c_void)) };
+        log::info!("NtUnmapViewOfSection Win32: {}", unsafe { GetLastError().to_hresult().message() });
         if status.is_err() {
             log::warn!("NtUnmapViewOfSection returned non-success status: {:?}. This might be okay.", status);
         } else {
@@ -140,6 +330,7 @@ impl PluginApp {
                 PAGE_EXECUTE_READWRITE,
             )
         } as usize;
+        log::info!("VirtualAllocEx Win32: {}", unsafe { GetLastError().to_hresult().message() });
         if new_base == 0 {
             return Err(anyhow::anyhow!("VirtualAllocEx failed: {}", std::io::Error::last_os_error()));
         }
@@ -158,9 +349,6 @@ impl PluginApp {
         log::info!("Headers written at: 0x{:X}", new_base);
 
         // 7. Write sections
-        use windows::Win32::System::Memory::{
-            VirtualProtectEx, PAGE_PROTECTION_FLAGS, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READONLY, PAGE_READWRITE, PAGE_NOACCESS,
-        };
         for section in pe.sections.iter() {
             let dest = (new_base + section.virtual_address as usize) as *mut c_void;
             let src_offset = section.pointer_to_raw_data as usize;
@@ -194,105 +382,87 @@ impl PluginApp {
         };
         log::info!("Remote PEB image base updated to 0x{:X}", new_base);
 
-        // 9. Apply relocations if needed
-        if new_base != image_base {
-            log::info!("Applying relocations (delta: 0x{:X})...", new_base.wrapping_sub(image_base));
-            if let Err(e) = apply_relocations(pe_data, h_process, new_base, image_base) {
-                log::error!("Relocations failed: {:?}", e);
-                return Err(e);
+        loop {
+            let mut ldr_ptr: u64 = 0;
+            unsafe { rpm_exact(h_process, pbi.PebBaseAddress as usize + 0x18, &mut ldr_ptr) }?;
+
+            if ldr_ptr != 0 {
+                break;          // the lists are ready – we can patch them
             }
+            unsafe { ResumeThread(h_thread) };                   // let the thread run a bit
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            unsafe { SuspendThread(h_thread) };
         }
 
-        // 10. Patch TLS directory if present
-        let tls_dir_opt = opt.data_directories.get_tls_table();
-        if let Some(tls_dir) = tls_dir_opt {
-            if tls_dir.virtual_address != 0 && tls_dir.size >= 24 {
-                log::info!("Patching TLS directory at RVA 0x{:X}", tls_dir.virtual_address);
-                let tls_va = tls_dir.virtual_address as usize;
-                let tls_rva_offset = rva_to_offset(pe_data, tls_va).unwrap_or(0);
-                    #[repr(C)]
-                    #[derive(Copy, Clone, Debug)]
-                    struct ImageTlsDirectory64 {
-                        start_address_of_raw_data: u64,
-                        end_address_of_raw_data: u64,
-                        address_of_index: u64,
-                        address_of_callbacks: u64,
-                        size_of_zero_fill: u32,
-                        characteristics: u32,
-                    }
+        dump_first_ldr_entry(
+            h_process, 
+            pbi.PebBaseAddress as *const _
+        ).context("dump_first_ldr_entry")?;
 
-                if tls_rva_offset > 0 && tls_rva_offset + std::mem::size_of::<ImageTlsDirectory64>() <= pe_data.len() {
+        if let Err(e) = fix_ldr_entry(
+            h_process, 
+            pbi.PebBaseAddress as *const PEB, 
+            new_base, 
+            size_of_image, 
+            entry_rva
+        ) {
+            log::error!("Error fixing LDR entry: {e:?}");
+        }
 
+        dump_first_ldr_entry(
+            h_process, 
+            pbi.PebBaseAddress as *const _
+        ).context("dump_first_ldr_entry")?;
 
-                    let tls_dir_struct: &ImageTlsDirectory64 = unsafe { &*(pe_data.as_ptr().add(tls_rva_offset) as *const ImageTlsDirectory64) };
-                    let mut patched_tls = *tls_dir_struct;
-                    let delta = new_base.wrapping_sub(image_base);
+        // 9. relocate once
+        if new_base != image_base {
+            let delta = new_base.wrapping_sub(image_base);
+            apply_relocations(pe_data, h_process, new_base, image_base)?;
 
-                    let patch_field = |field: u64| {
-                        if field != 0 {
-                            let new_field = field.wrapping_add(delta as u64);
-                            log::debug!("TLS field 0x{:X} patched to 0x{:X}", field, new_field);
-                            new_field
-                        } else {
-                            0
-                        }
-                    };
+            // ---- patch LOAD‑CONFIG absolute pointers --------------------------
+            if let Some(load_cfg) = opt.data_directories.get_load_config_table() {
+                if load_cfg.virtual_address != 0 && load_cfg.size as usize >= 0x70 {
+                    let cfg_va  = new_base + load_cfg.virtual_address as usize;
 
-                    patched_tls.start_address_of_raw_data = patch_field(tls_dir_struct.start_address_of_raw_data);
-                    patched_tls.end_address_of_raw_data = patch_field(tls_dir_struct.end_address_of_raw_data);
-                    patched_tls.address_of_index = patch_field(tls_dir_struct.address_of_index);
-                    patched_tls.address_of_callbacks = patch_field(tls_dir_struct.address_of_callbacks);
+                    // make the page writable
+                    let mut old = PAGE_PROTECTION_FLAGS(0);
+                    unsafe { VirtualProtectEx(h_process,
+                    cfg_va as _,
+                    0x70,                 // we touch only the first 0x70 bytes
+                    PAGE_READWRITE,
+                    &mut old) }?;
 
-                    let remote_tls_addr = (new_base + tls_va) as *mut c_void;
-                    if unsafe {
-                        WriteProcessMemory(
-                            h_process,
-                            remote_tls_addr,
-                            &patched_tls as *const _ as *const c_void,
-                            std::mem::size_of::<ImageTlsDirectory64>(),
-                            None,
-                        )
-                    }
-                    .is_ok()
-                    {
-                        log::info!("TLS directory patched successfully at 0x{:X}", remote_tls_addr as usize);
-                    } else {
-                        log::warn!("Failed to write patched TLS directory to remote process.");
-                    }
-
-                    // Log TLS callbacks for debugging
-                    if patched_tls.address_of_callbacks != 0 {
-                        let mut callback_addr = patched_tls.address_of_callbacks;
-                        let mut index = 0;
-                        loop {
-                            let mut callback: u64 = 0;
-                            if unsafe {
-                                ReadProcessMemory(
-                                    h_process,
-                                    callback_addr as *const c_void,
-                                    &mut callback as *mut _ as *mut c_void,
-                                    std::mem::size_of::<u64>(),
-                                    None,
-                                )
-                            }
-                            .is_ok()
-                            {
-                                if callback == 0 {
-                                    break;
-                                }
-                                log::debug!("TLS callback {} at 0x{:X}", index, callback);
-                                callback_addr += std::mem::size_of::<u64>() as u64;
-                                index += 1;
-                            } else {
-                                log::warn!("Failed to read TLS callback at 0x{:X}", callback_addr);
-                                break;
-                            }
+                    // read-modify-write
+                    let mut buf = [0u8; 0x70];
+                    unsafe { ReadProcessMemory(h_process, cfg_va as _, buf.as_mut_ptr() as _, buf.len(), None) }?;
+                    for off in [0x58usize, 0x60] {
+                        let mut p = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+                        if p != 0 {
+                            p = p.wrapping_add(delta as u64);
+                            buf[off..off + 8].copy_from_slice(&p.to_le_bytes());
                         }
                     }
-                } else {
-                    log::warn!("TLS directory offset out of bounds, skipping patch.");
+                    unsafe { WriteProcessMemory(h_process, cfg_va as _, buf.as_ptr() as _, buf.len(), None) }?;
+
+                    // restore original protection
+                    unsafe { VirtualProtectEx(h_process, cfg_va as _, 0x70, old, &mut old) }?;
                 }
             }
+
+        }
+
+        // hide relocation info from Ldr  → zero directory entry *and* section header
+        if let Some((dir_off, _)) = opt.data_directories.data_directories[5] {
+            let zero8 = [0u8;8];
+            unsafe { 
+                WriteProcessMemory(
+                    h_process, 
+                    (new_base + dir_off) as _, 
+                    zero8.as_ptr() as _, 
+                    8, 
+                    None
+                ) 
+            }?;
         }
 
         // 11. Resolve imports
@@ -310,66 +480,6 @@ impl PluginApp {
             log::info!("No import directory found in PE.");
         }
 
-        // 12. Patch NtManageHotPatch for Windows 11 24H2+ compatibility
-        // if let Err(e) = patch_nt_manage_hotpatch64(h_process) {
-        //     let x = unsafe { GetLastError().to_hresult().message() };
-        //     log::warn!("patch_nt_manage_hotpatch64 failed: {:?} {:?}", e, x);
-        // } else {
-        //     log::info!("NtManageHotPatch64 patched successfully");
-        //     log::info!("NtManageHotPatch64 Win32: {}", unsafe { GetLastError().to_hresult().message() });
-        // }
-
-        // 13. Set final section protections
-        log::info!("Setting final section protections...");
-        for section in pe.sections.iter() {
-            let dest = (new_base + section.virtual_address as usize) as *mut c_void;
-            let size = std::cmp::max(section.virtual_size, section.size_of_raw_data) as usize;
-            let characteristics = section.characteristics;
-            if size > 0 {
-                let protection = if characteristics & 0x20000000 != 0 { // EXECUTE
-                    if characteristics & 0x40000000 != 0 { // READ
-                        if characteristics & 0x80000000 != 0 {
-                            PAGE_EXECUTE_READWRITE // Allow writes if needed
-                        } else {
-                            PAGE_EXECUTE_READ
-                        }
-                    } else {
-                        PAGE_EXECUTE_READ
-                    }
-                } else if characteristics & 0x80000000 != 0 { // WRITE
-                    PAGE_READWRITE
-                } else if characteristics & 0x40000000 != 0 { // READ
-                    PAGE_READONLY
-                } else {
-                    PAGE_NOACCESS
-                };
-                let mut old_protect = PAGE_PROTECTION_FLAGS(0);
-                if let Err(e) = unsafe { VirtualProtectEx(h_process, dest, size, protection, &mut old_protect) } {
-                    log::warn!(
-                        "Failed to set final protection for section {}: {:?}",
-                        String::from_utf8_lossy(section.name().unwrap_or_default().as_bytes()),
-                        e
-                    );
-                } else {
-                    log::info!("VirtualProtectEx Win32: {}", unsafe { GetLastError().to_hresult().message() });
-                    log::warn!(
-                        "Set protection for section {} to 0x{:X} at 0x{:X} (size: 0x{:X})",
-                        String::from_utf8_lossy(section.name().unwrap_or_default().as_bytes()),
-                        protection.0,
-                        dest as usize,
-                        size
-                    );
-                }
-            }
-        }
-        // Set PE header to READONLY
-        let mut old_protect_header = PAGE_PROTECTION_FLAGS(0);
-        if let Err(e) = unsafe { VirtualProtectEx(h_process, new_base as *mut c_void, size_of_headers, PAGE_READONLY, &mut old_protect_header) } {
-            log::warn!("Failed to set final protection for PE header: {:?}", e);
-        }
-        // unsafe { FlushInstructionCache(h_process, None, 0)? };
-        // log::info!("Final protections set and instruction cache flushed.");
-        
         // 14. Set thread context to new entry point
         let mut context = CONTEXT::default();
         context.ContextFlags = CONTEXT_ALL_AMD64;
@@ -378,7 +488,24 @@ impl PluginApp {
         log::error!("GetThreadContext Win32: {}", unsafe { windows::Win32::Foundation::GetLastError().to_hresult().message() });
         #[cfg(target_arch = "x86_64")]
         {
-            context.Rsp = (context.Rsp & !0xF) - 8; // Align stack to 16 bytes
+            context.Rsp = (context.Rsp & !0xF).wrapping_sub(8); // Align stack to 16 bytes
+            context.Rcx = new_base as u64;
+            context.Rdx = 0;
+            context.R8 = 0;
+            context.R9 = 0;
+            context.Rax = 0;
+            
+            let zero: u64 = 0;
+            unsafe { 
+                WriteProcessMemory(
+                    h_process, 
+                    context.Rsp as _, 
+                    &zero as *const u64 as *const c_void, 
+                    std::mem::size_of::<u64>(), 
+                    None
+                ) 
+            }?;
+
             context.Rip = new_base as u64 + entry_rva as u64;
         }
         #[cfg(target_arch = "x86")]
@@ -442,35 +569,34 @@ impl PluginApp {
         let original_entry_rva = pe.header.optional_header.as_ref().map(|opt| opt.standard_fields.address_of_entry_point).unwrap_or(0);
         let new_entry_rva = entry_rva;
         // Register diagnostics
-        let original_regs = (original_rip, original_rsp, original_rbp);
+        let _original_regs = (original_rip, original_rsp, original_rbp);
         let new_regs = (new_rip, new_rsp, context.Rbp);
         // TLS directory diagnostics
         let tls_before = original_tls_dir.as_ref().map(|d| (d.virtual_address, d.size)).unwrap_or((0,0));
         let tls_after = new_tls_dir.as_ref().map(|d| (d.virtual_address, d.size)).unwrap_or((0,0));
-
-        // Send diagnostics to channel
-        let diag = HollowDiagnostics {
-            base_address_before: remote_image_base,
-            base_address_after: new_base,
-            entry_point_rva_before: original_entry_rva,
-            entry_point_rva_after: new_entry_rva,
-            rip_before: original_regs.0,
-            rip_after: new_regs.0,
-            rsp_before: original_regs.1,
-            rsp_after: new_regs.1,
-            rbp_before: original_regs.2,
-            rbp_after: new_regs.2,
-            tls_rva_before: tls_before.0,
-            tls_rva_after: tls_after.0,
-            tls_size_before: tls_before.1,
-            tls_size_after: tls_after.1,
-            reloc_rva_before: reloc_rva,
-            reloc_rva_after: reloc_rva,
-            reloc_size_before: reloc_size,
-            reloc_size_after: reloc_size,
-            sections: section_diagnostics.clone(),
-        };
-        let _ = diag_sender.send(diag);
+        
+        // --- Remote PE diagnostics AFTER hollowing ---
+        hollow_diagnostics.base_address_after = new_base;
+        hollow_diagnostics.sections_after = get_remote_sections(h_process, new_base).ok().flatten();
+        hollow_diagnostics.imports_after = get_remote_imports(h_process, new_base).ok().flatten();
+        hollow_diagnostics.exports_after = get_remote_exports(h_process, new_base).ok().flatten();
+        hollow_diagnostics.tls_callbacks_after = get_remote_tls_callbacks(h_process, new_base).ok().flatten();
+        hollow_diagnostics.reloc_blocks_after = get_remote_relocations(h_process, new_base).ok().flatten();
+        hollow_diagnostics.entry_point_rva_before = original_entry_rva;
+        hollow_diagnostics.entry_point_rva_after = new_entry_rva;
+        hollow_diagnostics.rip_after = new_regs.0;
+        hollow_diagnostics.rsp_after = new_regs.1;
+        hollow_diagnostics.rbp_after = new_regs.2;
+        hollow_diagnostics.tls_rva_before = tls_before.0;
+        hollow_diagnostics.tls_rva_after = tls_after.0;
+        hollow_diagnostics.tls_size_before = tls_before.1;
+        hollow_diagnostics.tls_size_after = tls_after.1;
+        hollow_diagnostics.reloc_rva_before = reloc_rva;
+        hollow_diagnostics.reloc_rva_after = reloc_rva;
+        hollow_diagnostics.reloc_size_before = reloc_size;
+        hollow_diagnostics.reloc_size_after = reloc_size;
+        log::info!("DIAGS: {hollow_diagnostics:#?}");
+        let _ = diag_sender.send(hollow_diagnostics.clone());
         Ok(process_info.dwProcessId)
     }
 
@@ -509,6 +635,7 @@ impl PluginApp {
                 &mut process_info,
             )
         };
+        log::info!("CreateProcessA Win32: {}", unsafe { GetLastError().to_hresult().message() });
         if let Err(e) = create_res {
             log::warn!("[hollow][error] CreateProcessA failed: {}", e);
             return Err(anyhow::anyhow!("CreateProcessA failed: {}", e));
@@ -532,6 +659,7 @@ impl PluginApp {
                     &mut ret_len,
                 )
             };
+            log::info!("NtQueryInformationProcess Win32: {}", unsafe { GetLastError().to_hresult().message() });
             if status != windows::Win32::Foundation::NTSTATUS(0) {
                 log::warn!("[hollow][error] NtQueryInformationProcess failed: status=0x{:X}", status.0);
                 return Err(anyhow::anyhow!("NtQueryInformationProcess failed: status=0x{:X}", status.0));
@@ -541,8 +669,16 @@ impl PluginApp {
         };
         let image_base_addr_ptr = (peb_base_addr + 0x10) as *mut c_void;
         let read_res = unsafe {
-            ReadProcessMemory(h_process, image_base_addr_ptr, peb_addr_buf.as_mut_ptr() as _, 8, None)
+            ReadProcessMemory(
+                h_process, 
+                image_base_addr_ptr, 
+                peb_addr_buf.as_mut_ptr() as _, 
+                8, 
+                None
+            )
         };
+        log::info!("ReadProcessMemory Win32: {}", unsafe { GetLastError().to_hresult().message() });
+
         if let Err(e) = read_res {
             log::warn!("[hollow][error] ReadProcessMemory (PEB image base) failed: {}", e);
             return Err(anyhow::anyhow!("ReadProcessMemory (PEB image base) failed: {}", e));
@@ -553,6 +689,7 @@ impl PluginApp {
         // 3. Unmap original image
         let unmap_status = unsafe { NtUnmapViewOfSection(h_process, Some(remote_image_base as *mut c_void)) };
         log::warn!("[hollow] NtUnmapViewOfSection status: 0x{:X}", unmap_status.0);
+        log::info!("NtUnmapViewOfSection Win32: {}", unsafe { GetLastError().to_hresult().message() });
 
         // 4. Parse new EXE headers
         if pe_data.len() < 0x100 {
@@ -576,6 +713,8 @@ impl PluginApp {
                 PAGE_EXECUTE_READWRITE,
             )
         };
+        log::info!("VirtualAllocEx Win32: {}", unsafe { GetLastError().to_hresult().message() });
+
         let new_base = if alloc.is_null() {
             log::warn!("[hollow][warn] Preferred base allocation failed, trying fallback...");
             let fallback = unsafe {
@@ -587,6 +726,7 @@ impl PluginApp {
                     PAGE_EXECUTE_READWRITE,
                 )
             };
+            log::info!("VirtualAllocEx Win32: {}", unsafe { GetLastError().to_hresult().message() });
             if fallback.is_null() {
                 log::warn!("[hollow][error] VirtualAllocEx for new image failed");
                 return Err(anyhow::anyhow!("VirtualAllocEx for new image failed"));
@@ -602,6 +742,7 @@ impl PluginApp {
         let write_headers_res = unsafe {
             WriteProcessMemory(h_process, new_base as *mut c_void, pe_data.as_ptr() as _, size_of_headers, None)
         };
+        log::info!("WriteProcessMemory Win32: {}", unsafe { GetLastError().to_hresult().message() });
         if let Err(e) = write_headers_res {
             log::warn!("[hollow][error] WriteProcessMemory (headers) failed: {}", e);
             return Err(anyhow::anyhow!("WriteProcessMemory (headers) failed: {}", e));
@@ -678,8 +819,8 @@ impl PluginApp {
         }
 
         // 10. Resume main thread
-        let resume_res = unsafe { ResumeThread(h_thread) };
-        log::warn!("[hollow] ResumeThread returned: {}", resume_res);
+        // let resume_res = unsafe { ResumeThread(h_thread) };
+        // log::warn!("[hollow] ResumeThread returned: {}", resume_res);
 
         log::warn!("[hollow] Hollowing complete. New process PID: {}", process_info.dwProcessId);
         Ok(process_info.dwProcessId)

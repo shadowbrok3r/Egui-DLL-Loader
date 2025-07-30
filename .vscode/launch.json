@@ -1,0 +1,82 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'egui_dll_loader'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=egui_dll_loader",
+                    "--package=egui_dll_loader"
+                ],
+                "filter": {
+                    "name": "egui_dll_loader",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in executable 'egui_dll_loader'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--bin=egui_dll_loader",
+                    "--package=egui_dll_loader"
+                ],
+                "filter": {
+                    "name": "egui_dll_loader",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'hello_world_test'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=hello_world_test",
+                    "--package=hello_world_test"
+                ],
+                "filter": {
+                    "name": "hello_world_test",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in executable 'hello_world_test'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--bin=hello_world_test",
+                    "--package=hello_world_test"
+                ],
+                "filter": {
+                    "name": "hello_world_test",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

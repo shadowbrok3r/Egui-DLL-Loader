@@ -1055,6 +1055,7 @@ dependencies = [
  "libloading",
  "log",
  "rand",
+ "scroll",
  "serde",
  "serde_json",
  "simplelog",

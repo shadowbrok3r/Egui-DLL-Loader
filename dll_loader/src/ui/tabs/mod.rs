@@ -10,5 +10,6 @@ pub enum InjectionPage {
     ProcessHollowing,
     ReflectiveInjection,
     ManualMapping,
+    Logs,
     Help,
 }

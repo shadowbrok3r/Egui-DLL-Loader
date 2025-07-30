@@ -12,7 +12,7 @@ impl crate::PluginApp {
 
             ui.add_space(27.);
 
-            if ui.button(RichText::new("Hollow Process 2").color(Color32::LIGHT_RED)).clicked() {
+            if ui.button(RichText::new("Hollow Process").color(Color32::LIGHT_RED)).clicked() {
                 if let Some(plugin) = &self.selected_plugin {
                     self.open_diag_window = true;
                     let exe_path = self.process_to_hollow.clone();
@@ -56,7 +56,7 @@ impl crate::PluginApp {
                             }
                         });
                     } else if plugin.ends_with("exe") {
-                        // std::thread::spawn(move || {
+                        std::thread::spawn(move || {
                             use std::fs;
                             let exe_path = exe_path.clone();
                             let plugin_path = format!("{}\\{}", plugin_dir, plugin);
@@ -83,7 +83,7 @@ impl crate::PluginApp {
                                     log::error!("Process hollowing with EXE failed: {e}");
                                 }
                             }
-                        // });
+                        });
                     }
                     
                 } else { self.open_warning_modal = true; }

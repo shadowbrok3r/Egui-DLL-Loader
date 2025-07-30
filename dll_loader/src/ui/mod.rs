@@ -27,22 +27,6 @@ impl eframe::App for crate::PluginApp {
             self.target_pid = Some(pid);
         }
 
-        Window::new("Logs")
-        .open(&mut self.open_log_window)
-        .show(ctx, |ui| {
-            ui.set_min_height(400.);
-            egui_logger::logger_ui()
-            .warn_color(Color32::from_rgb(94, 215, 221)) 
-            .error_color(Color32::from_rgb(255, 55, 102)) 
-            .log_levels([true, true, true, false, false])
-            // there should be a way to set default false...
-            .enable_category("eframe".to_string(), false)
-            .enable_category("eframe::native::glow_integration".to_string(), false)
-            .enable_category("egui_glow::shader_version".to_string(), false)
-            .enable_category("egui_glow::painter".to_string(), false)
-            .show(ui)
-        });
-
         self.top_panel(ctx);
         self.page_content(ctx);
         self.warning_modal(ctx);
@@ -83,9 +67,8 @@ impl crate::PluginApp {
                 ui.selectable_value(&mut self.current_page, tabs::InjectionPage::ProcessHollowing, "Process Hollowing");
                 ui.selectable_value(&mut self.current_page, tabs::InjectionPage::ReflectiveInjection, "Reflective Injection");
                 ui.selectable_value(&mut self.current_page, tabs::InjectionPage::ManualMapping, "Manual Mapping");
+                ui.selectable_value(&mut self.current_page,tabs::InjectionPage::Logs,  "Logs");
                 ui.selectable_value(&mut self.current_page, tabs::InjectionPage::Help, "Help");
-                ui.add_space(10.);
-                ui.toggle_value(&mut self.open_log_window, "Logs");
             });
 
             // Page-specific controls
@@ -105,6 +88,16 @@ impl crate::PluginApp {
                     | tabs::InjectionPage::ReflectiveInjection
                     | tabs::InjectionPage::ManualMapping => self.classic_injection(ui),
                 tabs::InjectionPage::ProcessHollowing => self.process_hollowing(ui),
+                tabs::InjectionPage::Logs => egui_logger::logger_ui()
+                    .warn_color(Color32::from_rgb(94, 215, 221)) 
+                    .error_color(Color32::from_rgb(255, 55, 102)) 
+                    .log_levels([true, true, true, false, false])
+                    // there should be a way to set default false...
+                    .enable_category("eframe".to_string(), false)
+                    .enable_category("eframe::native::glow_integration".to_string(), false)
+                    .enable_category("egui_glow::shader_version".to_string(), false)
+                    .enable_category("egui_glow::painter".to_string(), false)
+                    .show(ui),
                 tabs::InjectionPage::Help => self.help(ui),
             }
         });
@@ -115,96 +108,207 @@ impl crate::PluginApp {
         Window::new("Changes")
             .open(&mut self.open_diag_window)
             .show(ctx, |ui| {
-                let diag_info = &self.diag_info;
+                
+                let base_address_before = self.diag_info.base_address_before;
+                let base_address_after = self.diag_info.base_address_after;
+                let entry_point_rva_before = self.diag_info.entry_point_rva_before;
+                let entry_point_rva_after = self.diag_info.entry_point_rva_after;
+                let rip_before = self.diag_info.rip_before;
+                let rip_after = self.diag_info.rip_after;
+                let rsp_before = self.diag_info.rsp_before;
+                let rsp_after = self.diag_info.rsp_after;
+                let rbp_before = self.diag_info.rbp_before;
+                let rbp_after = self.diag_info.rbp_after;
+                let tls_rva_before = self.diag_info.tls_rva_before;
+                let tls_rva_after = self.diag_info.tls_rva_after;
+                let tls_size_before = self.diag_info.tls_size_before;
+                let tls_size_after = self.diag_info.tls_size_after;
+                let reloc_rva_before = self.diag_info.reloc_rva_before;
+                let reloc_rva_after = self.diag_info.reloc_rva_after;
+                let reloc_size_before = self.diag_info.reloc_size_before;
+                let reloc_size_after = self.diag_info.reloc_size_after;
+                let sections_before = &self.diag_info.sections_before;
+                let sections_after = &self.diag_info.sections_after;
+                let imports_before = &self.diag_info.imports_before;
+                let imports_after = &self.diag_info.imports_after;
+                let exports_before = &self.diag_info.exports_before;
+                let exports_after = &self.diag_info.exports_after;
+                let tls_callbacks_before = &self.diag_info.tls_callbacks_before;
+                let tls_callbacks_after = &self.diag_info.tls_callbacks_after;
+                let reloc_blocks_before = &self.diag_info.reloc_blocks_before;
+                let reloc_blocks_after = &self.diag_info.reloc_blocks_after;
+
                 ScrollArea::vertical().show(ui, |ui| {
                     ui.vertical_centered(|ui| ui.heading("Process Hollowing Diagnostics"));
                     ui.separator();
                     ui.horizontal(|ui| {
-                        ui.label(format!("Base Address: 0x{:X}", diag_info.base_address_before));
+                        ui.label(format!("Base Address: 0x{:X}", base_address_before));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(format!("0x{:X}", diag_info.base_address_after));
+                            ui.label(format!("0x{:X}", base_address_after));
                         });
                     });
 
                     ui.horizontal(|ui| {
-                        ui.label(format!("Entry Point RVA: 0x{:X}", diag_info.entry_point_rva_before));
+                        ui.label(format!("Entry Point RVA: 0x{:X}", entry_point_rva_before));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(format!("0x{:X}", diag_info.entry_point_rva_after));
+                            ui.label(format!("0x{:X}", entry_point_rva_after));
                         });
                     });
 
                     ui.horizontal(|ui| {
-                        ui.label(format!("RIP: 0x{:X}", diag_info.rip_before));
+                        ui.label(format!("RIP: 0x{:X}", rip_before));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(format!("0x{:X}", diag_info.rip_after));
+                            ui.label(format!("0x{:X}", rip_after));
                         });
                     });
 
                     ui.horizontal(|ui| {
-                        ui.label(format!("RSP: 0x{:X}", diag_info.rsp_before));
+                        ui.label(format!("RSP: 0x{:X}", rsp_before));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(format!("0x{:X}", diag_info.rsp_after));
+                            ui.label(format!("0x{:X}", rsp_after));
                         });
                     });
 
 
                     ui.horizontal(|ui| {
-                        ui.label(format!("RBP: 0x{:X}", diag_info.rbp_before));
+                        ui.label(format!("RBP: 0x{:X}", rbp_before));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(format!("0x{:X}", diag_info.rbp_after));
+                            ui.label(format!("0x{:X}", rbp_after));
                         });
                     });
 
                     ui.horizontal(|ui| {
-                        ui.label(format!("TLS Directory RVA: 0x{:X}", diag_info.tls_rva_before));
+                        ui.label(format!("TLS Directory RVA: 0x{:X}", tls_rva_before));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(format!("0x{:X}", diag_info.tls_rva_after));
+                            ui.label(format!("0x{:X}", tls_rva_after));
                         });
                     });
 
                     ui.horizontal(|ui| {
-                        ui.label(format!("TLS Directory Size: 0x{:X}", diag_info.tls_size_before));
+                        ui.label(format!("TLS Directory Size: 0x{:X}", tls_size_before));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(format!("0x{:X}", diag_info.tls_size_after));
+                            ui.label(format!("0x{:X}", tls_size_after));
                         });
                     });
                     
                     ui.horizontal(|ui| {
-                        ui.label(format!("Relocation Table RVA: 0x{:X}", diag_info.reloc_rva_before));
+                        ui.label(format!("Relocation Table RVA: 0x{:X}", reloc_rva_before));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(format!("0x{:X}", diag_info.reloc_rva_after));
+                            ui.label(format!("0x{:X}", reloc_rva_after));
                         });
                     });
 
                     ui.horizontal(|ui| {
-                        ui.label(format!("Relocation Table Size: 0x{:X}", diag_info.reloc_size_before));
+                        ui.label(format!("Relocation Table Size: 0x{:X}", reloc_size_before));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(format!("0x{:X}", diag_info.reloc_size_after));
+                            ui.label(format!("0x{:X}", reloc_size_after));
                         });
                     });
-                    
-                    ui.separator();
-                    ui.heading("Sections");
-                    ui.columns(7, |cols| {
-                        cols[0].label("Name");
-                        cols[1].label("RVA");
-                        cols[2].label("RawPtr");
-                        cols[3].label("RawSize");
-                        cols[4].label("VirtSize");
-                        cols[5].label("Characteristics");
-                        cols[6].label("Protection");
-                    });
-                    for (name, rva, raw_ptr, raw_size, virt_size, characteristics, protection) in &diag_info.sections {
-                        ui.columns(7, |cols| {
-                            cols[0].label(name);
-                            cols[1].label(format!("0x{:X}", rva));
-                            cols[2].label(format!("0x{:X}", raw_ptr));
-                            cols[3].label(format!("0x{:X}", raw_size));
-                            cols[4].label(format!("0x{:X}", virt_size));
-                            cols[5].label(format!("0x{:X}", characteristics));
-                            cols[6].label(*protection);
+
+                    ui.columns(2, |ui| {
+                        ui[0].vertical_centered(|ui| {
+                            if let Some(sections) = &sections_before {
+                                ui.separator();
+                                ui.heading("Sections Before");
+                                for section in sections.iter() {
+                                    ui.label(section.clone());
+                                }
+                            }
                         });
-                    }
+                        ui[1].vertical_centered(|ui| {
+                            if let Some(sections) = &sections_after {
+                                ui.separator();
+                                ui.heading("Sections After");
+                                for section in sections.iter() {
+                                    ui.label(section.clone());
+                                }
+                            }
+                        });
+                    });
+
+                    ui.columns(2, |ui| {
+                        ui[0].vertical_centered(|ui| {
+                            if let Some(imports) = &imports_before {
+                                ui.separator();
+                                ui.heading("Imports Before");
+                                for import in imports.iter() {
+                                    ui.label(import.clone());
+                                }
+                            }
+                        });
+                        ui[1].vertical_centered(|ui| {
+                            if let Some(imports) = &imports_after {
+                                ui.separator();
+                                ui.heading("Imports After");
+                                for import in imports.iter() {
+                                    ui.label(import.clone());
+                                }
+                            }
+                        });
+                    });
+
+                    ui.columns(2, |ui| {
+                        ui[0].vertical_centered(|ui| {
+                            if let Some(exports) = &exports_before {
+                                ui.separator();
+                                ui.heading("Exports Before");
+                                for export in exports.iter() {
+                                    ui.label(export.clone());
+                                }
+                            }
+                        });
+                        ui[1].vertical_centered(|ui| {
+                            if let Some(exports) = &exports_after {
+                                ui.separator();
+                                ui.heading("Exports After");
+                                for export in exports.iter() {
+                                    ui.label(export.clone());
+                                }
+                            }
+                        });
+                    });
+
+                    ui.columns(2, |ui| {
+                        ui[0].vertical_centered(|ui| {
+                            if let Some(tls_callbacks) = &tls_callbacks_before {
+                                ui.separator();
+                                ui.heading("TLS Callbacks Before");
+                                for tls_callback in tls_callbacks.iter() {
+                                    ui.label(format!("0x{tls_callback:X}"));
+                                }
+                            }
+                        });
+                        ui[1].vertical_centered(|ui| {
+                            if let Some(tls_callbacks) = &tls_callbacks_after {
+                                ui.separator();
+                                ui.heading("TLS Callbacks After");
+                                for tls_callback in tls_callbacks.iter() {
+                                    ui.label(format!("0x{tls_callback:X}"));
+                                }
+                            }
+                        });
+                    });
+
+                    ui.columns(2, |ui| {
+                        ui[0].vertical_centered(|ui| {
+                            if let Some(relocs) = &reloc_blocks_before {
+                                ui.separator();
+                                ui.heading("Relocations Before");
+                                for reloc in relocs.iter() {
+                                    ui.label(format!("0x{reloc:X}"));
+                                }
+                            }
+                        });
+                        ui[1].vertical_centered(|ui| {
+                            if let Some(relocs) = &reloc_blocks_after {
+                                ui.separator();
+                                ui.heading("Relocations After");
+                                for reloc in relocs.iter() {
+                                    ui.label(format!("0x{reloc:X}"));
+                                }
+                            }
+                        });
+                    });
                 });
             });
             

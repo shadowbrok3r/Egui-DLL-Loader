@@ -5,6 +5,9 @@ pub mod pe_types;
 pub mod inject;
 pub mod hollow;
 pub mod ui;
+pub mod remote_process;
+
+pub use remote_process::*;
 pub use pe_types::*;
 
 use crate::hollow::diagnostics::HollowDiagnostics;
@@ -29,7 +32,6 @@ pub struct PluginApp {
     first_run: bool,
     process_search_string: String,
     current_page: ui::tabs::InjectionPage,
-    open_log_window: bool,
     evasion_mode: bool,
     thread_hijack_mode: bool,
     diag_info: HollowDiagnostics,
@@ -70,7 +72,6 @@ impl PluginApp {
             diag_info: HollowDiagnostics::default(),
             plugin_dir: default_dir,
             selected_plugin: None,
-            open_log_window: false,
             open_diag_window: false,
             plugins,
             processes,
