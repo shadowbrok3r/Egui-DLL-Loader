@@ -390,7 +390,7 @@ impl PluginApp {
                 break;          // the lists are ready – we can patch them
             }
             unsafe { ResumeThread(h_thread) };                   // let the thread run a bit
-            std::thread::sleep(std::time::Duration::from_secs(2));
+            std::thread::sleep(std::time::Duration::from_millis(2));
             unsafe { SuspendThread(h_thread) };
         }
 
@@ -417,7 +417,16 @@ impl PluginApp {
         // 9. relocate once
         if new_base != image_base {
             let delta = new_base.wrapping_sub(image_base);
-            apply_relocations(pe_data, h_process, new_base, image_base)?;
+            let (guard_cd_rva, guard_lj_rva) = if let Some(cfg) = opt.data_directories.get_load_config_table() {
+                (
+                    cfg.virtual_address as usize + 0x58, // GuardCFFunctionTable
+                    cfg.virtual_address as usize + 0x60
+                )
+            } else {
+                (usize::MAX, usize::MAX) 
+            };
+
+            apply_relocations(pe_data, h_process, new_base, image_base, guard_cd_rva, guard_lj_rva)?;
 
             // ---- patch LOAD‑CONFIG absolute pointers --------------------------
 
@@ -526,13 +535,13 @@ impl PluginApp {
 
         // 15. Resume thread
         log::info!("Resuming main thread...");
-        let resume_count = unsafe { ResumeThread(h_thread) };
-        if resume_count == u32::MAX {
-            let err = unsafe { windows::Win32::Foundation::GetLastError() };
-            log::error!("Win32 Error: {}", err.to_hresult().message());
-            return Err(anyhow::anyhow!("ResumeThread failed"));
-        }
-        log::info!("ResumeThread returned: {}", resume_count);
+        // let resume_count = unsafe { ResumeThread(h_thread) };
+        // if resume_count == u32::MAX {
+        //     let err = unsafe { windows::Win32::Foundation::GetLastError() };
+        //     log::error!("Win32 Error: {}", err.to_hresult().message());
+        //     return Err(anyhow::anyhow!("ResumeThread failed"));
+        // }
+        // log::info!("ResumeThread returned: {}", resume_count);
 
         log::info!("Hollowing complete. New process PID: {}", process_info.dwProcessId);
 
@@ -1300,7 +1309,14 @@ impl PluginApp {
 }
 
 
-pub fn apply_relocations(pe_data: &[u8], process_handle: HANDLE, new_base: usize, preferred_base: usize) -> anyhow::Result<()> {
+pub fn apply_relocations(
+    pe_data: &[u8], 
+    process_handle: HANDLE, 
+    new_base: usize, 
+    preferred_base: usize,
+    guard_cf_rva: usize,
+    guard_lj_rva: usize,
+) -> anyhow::Result<()> {
     use goblin::pe::PE;
     let pe = PE::parse(pe_data)?;
     let delta = new_base.wrapping_sub(preferred_base);
@@ -1358,11 +1374,14 @@ pub fn apply_relocations(pe_data: &[u8], process_handle: HANDLE, new_base: usize
                 continue;
             }
 
-            // if matches!(
-            //     reloc_addr.wrapping_sub(new_base),
-            //     load_config.virtual_address as usize + 0x58 | 
-            //     load_config.virtual_address as usize + 0x60
-            // ) { continue; }
+            // RVA inside the image that this relocation touches.
+            let reloc_rva = reloc_addr.wrapping_sub(new_base);
+
+            // Skip the two Guard-CF pointers - they must stay absolute
+            if reloc_rva == guard_cf_rva || reloc_rva == guard_lj_rva {
+                log::warn!("Skipping Guard CF relocation at RVA 0x{:X}", reloc_rva);
+                continue;
+            }
 
             match reloc_type {
                 3 => {
@@ -1428,10 +1447,28 @@ pub fn apply_relocations(pe_data: &[u8], process_handle: HANDLE, new_base: usize
                     );
 
                     if let Err(e) = read_res {
-                        log::error!("ReadProcessMemory failed: {:?}", e);
+                        log::error!("ReadProcessMemory (DIR64) failed: {:?}", e);
                         continue;
                     }
                     let new_value = original_value.wrapping_add(delta as u64);
+                    /* ---------- make the target slot writable ---------- */
+                    let mut old = PAGE_PROTECTION_FLAGS(0);
+                    let vp_ok = unsafe {
+                        VirtualProtectEx(
+                            process_handle,
+                            reloc_addr as *mut _,
+                            8,                        // just this QWORD
+                            PAGE_READWRITE,
+                            &mut old,
+                        )
+                    }.is_ok();
+
+                    if !vp_ok {
+                        log::warn!("VirtualProtectEx failed @0x{:X} – skipping reloc", reloc_addr);
+                        continue;
+                    }
+
+                    /* ---------- perform the write ---------- */
                     let write_res = unsafe {
                         WriteProcessMemory(
                             process_handle,
@@ -1450,6 +1487,20 @@ pub fn apply_relocations(pe_data: &[u8], process_handle: HANDLE, new_base: usize
                     if let Err(e) = write_res {
                         log::error!("WriteProcessMemory(DIR64) failed: {:?}", e);
                         continue;
+                    }
+
+                    /* ---------- restore original protection ---------- */
+                    let set_old_protection_flags = unsafe {
+                        VirtualProtectEx(
+                            process_handle,
+                            reloc_addr as *mut _,
+                            8,
+                            old,
+                            &mut old,
+                        )
+                    };
+                    if let Err(e) = set_old_protection_flags {
+                        log::error!("Error setting old protection flags: {e:?}");
                     }
                 }
                 0 => {} // IMAGE_REL_BASED_ABSOLUTE (skip)
@@ -1515,19 +1566,34 @@ pub fn resolve_imports(dll_data: &[u8], process_handle: HANDLE, base_addr: *mut 
             };
             if let Some(addr) = func_addr {
                 log::debug!("Resolved function at 0x{:X} for IAT 0x{:X}", addr as usize, iat_addr as usize);
+                let slot      = iat_addr as *mut c_void;
+                let page_base = (iat_addr as usize & !0xFFF) as *mut c_void;   // 4 KiB align
+                let mut old   = PAGE_PROTECTION_FLAGS(0);
+
+                /* 1. make the page writable */
+                unsafe {
+                    VirtualProtectEx(process_handle, page_base, 0x1000, PAGE_READWRITE, &mut old)?
+                }
+
+                /* 2. write the thunk */
                 let write_result = unsafe {
                     WriteProcessMemory(
                         process_handle,
-                        iat_addr as *mut c_void,
-                        &(addr as u64) as *const _ as *const c_void,
+                        slot,
+                        &(addr as u64) as *const _ as _,
                         8,
                         None,
                     )
                 };
+
                 if let Err(e) = write_result {
                     log::error!("Failed to write IAT entry at 0x{:X}: {:?}", iat_addr as usize, e);
                     return Err(anyhow::anyhow!("Failed to write IAT entry at 0x{:X}: {:?}", iat_addr as usize, e));
                 }
+                /* 3. restore original protection */
+                unsafe {
+                    VirtualProtectEx(process_handle, page_base, 0x1000, old, &mut old)?
+                };
             } else {
                 log::warn!(
                     "Failed to resolve function {} (ordinal: {}) from {}, writing 0 to IAT",
