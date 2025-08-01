@@ -72,7 +72,7 @@ unsafe fn rpm_exact<T: Default + Copy>(
         Some(&mut read),
     ) };
 
-    log::error!("Status: {status:?}");
+    log::warn!("ReadProcessMemory Status: {status:?}");
     // success if we obtained all bytes
     if read == std::mem::size_of::<T>() {
         return Ok(());
@@ -82,10 +82,10 @@ unsafe fn rpm_exact<T: Default + Copy>(
     let gle = unsafe { GetLastError() };
     Err(anyhow::anyhow!(
         "RPM 0x{:X} wanted {} got {}  (GLE = 0x{:X})",
-                        remote,
-                        std::mem::size_of::<T>(),
-                        read,
-                        gle.0
+        remote,
+        std::mem::size_of::<T>(),
+        read,
+        gle.0
     ))
 }
 
@@ -108,10 +108,10 @@ fn read_remote<T: Default + Copy>(
         if !ok || read != std::mem::size_of::<T>() {
             return Err(anyhow::anyhow!(
                 "RPM 0x{:X} wanted {} got {} (gle={})",
-                                       addr,
-                                       std::mem::size_of::<T>(),
-                                       read,
-                                       GetLastError().0
+                addr,
+                std::mem::size_of::<T>(),
+                read,
+                GetLastError().0
             ));
         }
     }
@@ -390,7 +390,7 @@ impl PluginApp {
                 break;          // the lists are ready – we can patch them
             }
             unsafe { ResumeThread(h_thread) };                   // let the thread run a bit
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            std::thread::sleep(std::time::Duration::from_secs(2));
             unsafe { SuspendThread(h_thread) };
         }
 
@@ -427,11 +427,15 @@ impl PluginApp {
 
                     // make the page writable
                     let mut old = PAGE_PROTECTION_FLAGS(0);
-                    unsafe { VirtualProtectEx(h_process,
-                    cfg_va as _,
-                    0x70,                 // we touch only the first 0x70 bytes
-                    PAGE_READWRITE,
-                    &mut old) }?;
+                    unsafe { 
+                        VirtualProtectEx(
+                            h_process,
+                            cfg_va as _,
+                            0x70,                 // we touch only the first 0x70 bytes
+                            PAGE_READWRITE,
+                            &mut old
+                        ) 
+                    }?;
 
                     // read-modify-write
                     let mut buf = [0u8; 0x70];
@@ -449,8 +453,6 @@ impl PluginApp {
                     unsafe { VirtualProtectEx(h_process, cfg_va as _, 0x70, old, &mut old) }?;
                 }
             }
-
-
         }
 
         // hide relocation info from Ldr  → zero directory entry *and* section header
@@ -1355,6 +1357,13 @@ pub fn apply_relocations(pe_data: &[u8], process_handle: HANDLE, new_base: usize
                 );
                 continue;
             }
+
+            // if matches!(
+            //     reloc_addr.wrapping_sub(new_base),
+            //     load_config.virtual_address as usize + 0x58 | 
+            //     load_config.virtual_address as usize + 0x60
+            // ) { continue; }
+
             match reloc_type {
                 3 => {
                     // IMAGE_REL_BASED_HIGHLOW (32-bit)
@@ -1395,7 +1404,7 @@ pub fn apply_relocations(pe_data: &[u8], process_handle: HANDLE, new_base: usize
                         write_res.is_ok()
                     );
                     if let Err(e) = write_res {
-                        log::warn!("WriteProcessMemory failed: {:?}", e);
+                        log::warn!("WriteProcessMemory(HIGHLOW) failed: {:?}", e);
                         return Err(e.into());
                     }
                 }
@@ -1417,9 +1426,10 @@ pub fn apply_relocations(pe_data: &[u8], process_handle: HANDLE, new_base: usize
                         original_value,
                         read_res.is_ok()
                     );
+
                     if let Err(e) = read_res {
-                        log::warn!("ReadProcessMemory failed: {:?}", e);
-                        return Err(e.into());
+                        log::error!("ReadProcessMemory failed: {:?}", e);
+                        continue;
                     }
                     let new_value = original_value.wrapping_add(delta as u64);
                     let write_res = unsafe {
@@ -1438,12 +1448,12 @@ pub fn apply_relocations(pe_data: &[u8], process_handle: HANDLE, new_base: usize
                         write_res.is_ok()
                     );
                     if let Err(e) = write_res {
-                        log::warn!("WriteProcessMemory failed: {:?}", e);
-                        return Err(e.into());
+                        log::error!("WriteProcessMemory(DIR64) failed: {:?}", e);
+                        continue;
                     }
                 }
                 0 => {} // IMAGE_REL_BASED_ABSOLUTE (skip)
-                _ => log::warn!("Unhandled relocation type: {}", reloc_type),
+                _ => log::error!("Unhandled relocation type: {}", reloc_type),
             }
         }
         offset += block_size as usize;
