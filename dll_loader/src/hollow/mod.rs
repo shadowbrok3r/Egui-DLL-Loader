@@ -420,6 +420,7 @@ impl PluginApp {
             apply_relocations(pe_data, h_process, new_base, image_base)?;
 
             // ---- patch LOAD‑CONFIG absolute pointers --------------------------
+
             if let Some(load_cfg) = opt.data_directories.get_load_config_table() {
                 if load_cfg.virtual_address != 0 && load_cfg.size as usize >= 0x70 {
                     let cfg_va  = new_base + load_cfg.virtual_address as usize;
@@ -448,6 +449,7 @@ impl PluginApp {
                     unsafe { VirtualProtectEx(h_process, cfg_va as _, 0x70, old, &mut old) }?;
                 }
             }
+
 
         }
 
