@@ -317,31 +317,25 @@ impl PluginApp {
                 // ---- ALWAYS disable Guard CF / XFG ------------------------------
 
                 if let Some(cfg) = opt.data_directories.get_load_config_table() {
-                    // size_of_loadconfig on x64 Rust 1.77 ≈ 0x148, but use the value in the directory
-                    let cfg_size = cfg.size as usize;
-                    if cfg.virtual_address != 0 && cfg_size >= 0x48 {         // sanity
-                        let cfg_va = new_base + cfg.virtual_address as usize;
+                    let cfg_va = new_base + cfg.virtual_address as usize;
 
-                        // make whole directory writable
-                        let mut old = PAGE_PROTECTION_FLAGS(0);
-                        VirtualProtectEx(h_process, cfg_va as _, cfg_size, PAGE_READWRITE, &mut old)?;
+                    // make whole directory writable
+                    let mut old = PAGE_PROTECTION_FLAGS(0);
+                    // cfg_va = VA of the load-config directory
+                    let guard_off   = 0x48;           // GuardFlags
+                    let guard_bytes = 0x80;           // covers GuardCF + XFG fields
+                    let zero_buf    = [0u8; 0x80];
 
-                        // zero everything *except* Size (0x0-3) and TimeDateStamp (0x4-7)
-                        let zero_buf = vec![0u8; cfg_size - 0x40];
-                        WriteProcessMemory(
-                            h_process,
-                            (cfg_va + 0x40) as _,
-                            zero_buf.as_ptr() as _,
-                            zero_buf.len(),
-                            None,
-                        )?;
+                    VirtualProtectEx(h_process, (cfg_va + guard_off) as _, guard_bytes,
+                        PAGE_READWRITE, &mut old)?;
+                    WriteProcessMemory(h_process,
+                        (cfg_va + guard_off) as _,
+                        zero_buf.as_ptr() as _,
+                        guard_bytes,
+                        None)?;
+                    VirtualProtectEx(h_process, (cfg_va + guard_off) as _, guard_bytes,
+                        old, &mut old)?;
 
-                        VirtualProtectEx(h_process, cfg_va as _, cfg_size, old, &mut old)?;
-                        log::info!("Wiped full Guard-CF/XFG area ({} bytes)", cfg_size);
-                        let mut chk: u64 = 1;
-                        ReadProcessMemory(h_process, (cfg_va + 0xC0) as _, &mut chk as *mut _ as _, 8, None)?;
-                        log::info!("XFG Check Ptr = 0x{:016X}", chk);
-                    }
                     
                 }
             }
