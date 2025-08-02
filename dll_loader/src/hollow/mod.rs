@@ -217,6 +217,8 @@ impl PluginApp {
         };
         log::info!("Headers written at: 0x{:X}", new_base);
 
+        unsafe { wipe_load_config_dir(h_process, new_base, &pe) }?;
+
         // 7. Write sections
         for section in pe.sections.iter() {
             let dest = (new_base + section.virtual_address as usize) as *mut c_void;
@@ -315,57 +317,33 @@ impl PluginApp {
                 // ---- ALWAYS disable Guard CF / XFG ------------------------------
 
                 if let Some(cfg) = opt.data_directories.get_load_config_table() {
-                    if cfg.virtual_address != 0 && cfg.size as usize >= 0x90 {
+                    // size_of_loadconfig on x64 Rust 1.77 ≈ 0x148, but use the value in the directory
+                    let cfg_size = cfg.size as usize;
+                    if cfg.virtual_address != 0 && cfg_size >= 0x48 {         // sanity
                         let cfg_va = new_base + cfg.virtual_address as usize;
 
-                        // Make the first 0x90 bytes writable
+                        // make whole directory writable
                         let mut old = PAGE_PROTECTION_FLAGS(0);
-                        VirtualProtectEx(
-                            h_process,
-                            cfg_va as _,
-                            0x90,
-                            PAGE_READWRITE,
-                            &mut old
-                        )?;
+                        VirtualProtectEx(h_process, cfg_va as _, cfg_size, PAGE_READWRITE, &mut old)?;
 
-                        // 1️⃣ clear GuardFlags bit-0 (CFG-Enabled) and bit-8 (XFG-Enabled)
-                        let zero_u32: u32 = 0;
+                        // zero everything *except* Size (0x0-3) and TimeDateStamp (0x4-7)
+                        let zero_buf = vec![0u8; cfg_size - 0x40];
                         WriteProcessMemory(
                             h_process,
-                            (cfg_va + 0x48) as _,
-                            &zero_u32 as *const _ as _,
-                            4,
-                            None
+                            (cfg_va + 0x40) as _,
+                            zero_buf.as_ptr() as _,
+                            zero_buf.len(),
+                            None,
                         )?;
 
-                        // 2️⃣ zero all Guard-CF / XFG pointer-count pairs
-                        let zero_u64: u64 = 0;
-                        for off in [0x40, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80] {
-                            WriteProcessMemory(
-                                h_process,
-                                (cfg_va + off) as _,
-                                &zero_u64 as *const _ as _,
-                                8,
-                                None
-                            )?;
-                        }
-
-                        let mut flags: u32 = 0xdeadbeef;
-                        ReadProcessMemory(
-                            h_process,
-                            (cfg_va + 0x48) as _,
-                            &mut flags as *mut _ as _,
-                            4,
-                            None
-                        )?;
-                        log::info!("GuardFlags (remote) = 0x{:08x}", flags);
-
-
-                        // restore protection
-                        VirtualProtectEx(h_process, cfg_va as _, 0x90, old, &mut old)?;
+                        VirtualProtectEx(h_process, cfg_va as _, cfg_size, old, &mut old)?;
+                        log::info!("Wiped full Guard-CF/XFG area ({} bytes)", cfg_size);
+                        let mut chk: u64 = 1;
+                        ReadProcessMemory(h_process, (cfg_va + 0xC0) as _, &mut chk as *mut _ as _, 8, None)?;
+                        log::info!("XFG Check Ptr = 0x{:016X}", chk);
                     }
+                    
                 }
-
             }
 
         
@@ -421,6 +399,25 @@ impl PluginApp {
             context.Rcx = entry;   // 1st parameter  = function pointer
             context.Rdx = 0;       // 2nd parameter  = argument (unused)
             context.Rip = rtl_start;
+
+            // just before SetThreadContext:
+            let quit = unsafe { GetProcAddress(
+                GetModuleHandleA(s!("ntdll.dll")).unwrap(),
+                s!("RtlExitUserThread")
+            ).unwrap() } as u64;
+
+            let dummy_ret = quit;
+            context.Rsp -= 8;
+            unsafe {
+                WriteProcessMemory(
+                    h_process,
+                    context.Rsp as _,
+                    &dummy_ret as *const _ as _,
+                    8,
+                    None,
+                )?;
+            }
+
         }
 
         #[cfg(target_arch = "x86")]
@@ -1804,6 +1801,50 @@ fn rpm_peek_u64(h_proc: HANDLE, addr: usize) -> Option<u64> {
         // any error, incl. ERROR_PARTIAL_COPY → “not ready”
         None
     }
+}
+
+/// zero IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG (index 10) in the remote image
+unsafe fn wipe_load_config_dir(
+        h_process: HANDLE,
+        new_base: usize,
+        pe: &goblin::pe::PE,
+) -> windows::core::Result<()> {
+    use goblin::pe::header::{SIZEOF_COFF_HEADER};
+    use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+
+    // ---------------------------------------------------------------------
+    // 1. Offsets inside the *file* ----------------------------------------
+    // ---------------------------------------------------------------------
+    let dos = &pe.header.dos_header;              // IMAGE_DOS_HEADER
+    let nt_off         = dos.pe_pointer as usize; // e_lfanew
+    let opt_hdr_off    = nt_off + 4 + SIZEOF_COFF_HEADER; // skip "PE\0\0" + COFF
+
+    // PE32+ (x64) Optional-Header layout: DataDirectory array starts at +0x70
+    const DATA_DIR_ARRAY_OFF_IN_OPT_HDR: usize = 0x70;
+    const DIR_ENTRY_SIZE:               usize = 8; // RVA + Size (u32 each)
+
+    // File offset of DataDirectory[10]
+    let dir10_file_off = opt_hdr_off
+                       + DATA_DIR_ARRAY_OFF_IN_OPT_HDR
+                       + 10 * DIR_ENTRY_SIZE;
+
+    // ---------------------------------------------------------------------
+    // 2. Remote VA where those 8 bytes live -------------------------------
+    // ---------------------------------------------------------------------
+    let dir10_va = new_base + dir10_file_off;
+
+    // zero RVA + Size
+    let zero8 = [0u8; 8];
+    unsafe { WriteProcessMemory(
+        h_process,
+        dir10_va as _,
+        zero8.as_ptr() as _,
+        zero8.len(),
+        None
+    ) }?;
+
+    log::info!("Load-Config directory entry wiped at 0x{:X}", dir10_va);
+    Ok(())
 }
 
 
