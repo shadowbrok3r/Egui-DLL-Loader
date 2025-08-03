@@ -317,10 +317,7 @@ impl PluginApp {
                 // ---- ALWAYS disable Guard CF / XFG ------------------------------
 
                 if let Some(cfg) = opt.data_directories.get_load_config_table() {
-                    // size_of_loadconfig on x64 Rust 1.77 ≈ 0x148, but use the value in the directory
-                    let cfg_size = cfg.size as usize;
-                    if cfg.virtual_address != 0 && cfg_size >= 0x48 {         // sanity
-                        let cfg_va = new_base + cfg.virtual_address as usize;
+                    let cfg_va = new_base + cfg.virtual_address as usize;
 
                         // make whole directory writable
                         let mut old = PAGE_PROTECTION_FLAGS(0);
