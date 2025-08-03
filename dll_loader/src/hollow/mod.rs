@@ -217,7 +217,7 @@ impl PluginApp {
         };
         log::info!("Headers written at: 0x{:X}", new_base);
 
-        unsafe { wipe_load_config_dir(h_process, new_base, &pe) }?;
+        // unsafe { wipe_load_config_dir(h_process, new_base, &pe) }?;
 
         // 7. Write sections
         for section in pe.sections.iter() {
@@ -324,23 +324,18 @@ impl PluginApp {
 
                         // make whole directory writable
                         let mut old = PAGE_PROTECTION_FLAGS(0);
-                        VirtualProtectEx(h_process, cfg_va as _, cfg_size, PAGE_READWRITE, &mut old)?;
 
-                        // zero everything *except* Size (0x0-3) and TimeDateStamp (0x4-7)
-                        let zero_buf = vec![0u8; cfg_size - 0x40];
-                        WriteProcessMemory(
-                            h_process,
-                            (cfg_va + 0x40) as _,
-                            zero_buf.as_ptr() as _,
-                            zero_buf.len(),
-                            None,
-                        )?;
+                        // GuardFlags + the 6 GuardCF / XFG pointers (0x48-0x80)
+                        const GUARD_OFF:   usize = 0x48;
+                        const GUARD_BYTES: usize = 0x38;   // 0x48..0x7F   ( **not** 0x80 )
 
-                        VirtualProtectEx(h_process, cfg_va as _, cfg_size, old, &mut old)?;
-                        log::info!("Wiped full Guard-CF/XFG area ({} bytes)", cfg_size);
-                        let mut chk: u64 = 1;
-                        ReadProcessMemory(h_process, (cfg_va + 0xC0) as _, &mut chk as *mut _ as _, 8, None)?;
-                        log::info!("XFG Check Ptr = 0x{:016X}", chk);
+                        let zero = [0u8; GUARD_BYTES];
+                        VirtualProtectEx(h_process, (cfg_va + GUARD_OFF) as _, GUARD_BYTES,
+                                        PAGE_READWRITE, &mut old)?;
+                        WriteProcessMemory(h_process, (cfg_va + GUARD_OFF) as _,
+                                        zero.as_ptr() as _, GUARD_BYTES, None)?;
+                        VirtualProtectEx(h_process, (cfg_va + GUARD_OFF) as _, GUARD_BYTES,
+                                        old, &mut old)?;
                     }
                     
                 }
@@ -381,43 +376,17 @@ impl PluginApp {
         // 14. Set thread context to new entry point
         let mut context = CONTEXT::default();
         context.ContextFlags = CONTEXT_ALL_AMD64;
+        unsafe { FlushInstructionCache(h_process, None, 0)? };
         log::info!("FlushInstructionCache Win32: {}", unsafe { GetLastError().to_hresult().message() });
         unsafe { GetThreadContext(h_thread, &mut context)? };
         log::error!("GetThreadContext Win32: {}", unsafe { windows::Win32::Foundation::GetLastError().to_hresult().message() });
         #[cfg(target_arch = "x86_64")]
         {
-            // address of our DLL/EXE entry
-            let entry = new_base as u64 + entry_rva as u64;
-
-            // address of the trampoline ntdll!RtlUserThreadStart
-            let rtl_start = unsafe { GetProcAddress(
-                GetModuleHandleA(s!("ntdll.dll")).unwrap(),
-                s!("RtlUserThreadStart")
-            ).unwrap() } as u64;
-
-            // --- build the context ---
-            context.Rcx = entry;   // 1st parameter  = function pointer
-            context.Rdx = 0;       // 2nd parameter  = argument (unused)
-            context.Rip = rtl_start;
-
-            // just before SetThreadContext:
-            let quit = unsafe { GetProcAddress(
-                GetModuleHandleA(s!("ntdll.dll")).unwrap(),
-                s!("RtlExitUserThread")
-            ).unwrap() } as u64;
-
-            let dummy_ret = quit;
-            context.Rsp -= 8;
-            unsafe {
-                WriteProcessMemory(
-                    h_process,
-                    context.Rsp as _,
-                    &dummy_ret as *const _ as _,
-                    8,
-                    None,
-                )?;
-            }
-
+            // Set RIP directly to our entry point to bypass RtlUserThreadStart issues
+            context.Rip = new_base as u64 + entry_rva as u64;
+            
+            // Ensure stack is properly aligned (16-byte alignment for x64 ABI)
+            context.Rsp = (context.Rsp & !0xF) - 8;
         }
 
         #[cfg(target_arch = "x86")]
@@ -540,7 +509,7 @@ impl PluginApp {
                 None,
                 None,
                 BOOL(0).into(),
-                CREATE_SUSPENDED,
+                CREATE_SUSPENDED | DETACHED_PROCESS,
                 None,
                 None,
                 &mut startup_info,
