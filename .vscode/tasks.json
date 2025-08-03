@@ -1,0 +1,83 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Test WASM Hollowing Fix",
+			"type": "shell",
+			"command": "cargo run",
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build and Test Process Hollowing",
+			"type": "shell",
+			"command": "cargo build --release && if ($LASTEXITCODE -eq 0) { .\\target\\release\\egui_dll_loader.exe } else { Write-Host 'Build failed' }",
+			"isBackground": false,
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Run Process Hollowing Test",
+			"type": "shell",
+			"command": ".\\target\\release\\egui_dll_loader.exe",
+			"isBackground": false,
+			"group": "test"
+		},
+		{
+			"label": "Build Updated Process Hollowing",
+			"type": "shell",
+			"command": "cargo build --release",
+			"isBackground": false,
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build with Calc Shellcode",
+			"type": "shell",
+			"command": "cargo build --release",
+			"isBackground": false,
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build Fixed Calc Shellcode",
+			"type": "shell",
+			"command": "cargo build --release",
+			"isBackground": false,
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build Fixed DLL Loading",
+			"type": "shell",
+			"command": "cargo build --release",
+			"isBackground": false,
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Run DLL Injection Test",
+			"type": "shell",
+			"command": "mkdir -p C:/temp && ./target/release/egui_dll_loader.exe",
+			"group": "test"
+		},
+		{
+			"label": "Check Temp Logs",
+			"type": "shell",
+			"command": "dir C:/temp",
+			"group": "test"
+		}
+	]
+}

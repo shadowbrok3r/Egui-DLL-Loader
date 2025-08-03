@@ -127,6 +127,26 @@ impl crate::PluginApp {
                     
                 } else { self.open_warning_modal = true; }
             }
+            ui.add_space(5.);
+
+            if ui.button(RichText::new("Hollow Process with WASM").color(Color32::LIGHT_GREEN)).clicked() {
+                let exe_path = self.process_to_hollow.clone();
+                if exe_path.is_empty() { self.open_warning_modal = true; }
+                let pid_tx = self.pid_tx.clone();
+                std::thread::spawn(move || {
+                    let exe_path = exe_path.clone();
+                    match unsafe { crate::PluginApp::hollow_process_with_wasm(&exe_path) } {
+                        Ok(pid) => {
+                            let _ = pid_tx.send(sysinfo::Pid::from_u32(pid));
+                            log::info!("Successfully hollowed process with WASM (PID: {pid})");
+                        },
+                        Err(e) => {
+                            log::error!("Win32: {}", unsafe { windows::Win32::Foundation::GetLastError().to_hresult().message() });
+                            log::error!("Process hollowing with EXE failed: {e}");
+                        }
+                    }
+                });
+            }
         });
     }
 

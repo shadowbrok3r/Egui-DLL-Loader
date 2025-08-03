@@ -18,7 +18,7 @@ dll-syringe = { version = "0.17.0", features = ["full"] }
 eframe = { version = "0.32.0", features = ["serde"] }
 egui-file-dialog = "0.11.0"
 sysinfo = "0.36.1"
-tokio = { version = "1.46.1", features = ["full"] }
+tokio = { version = "1.47.1", features = ["full"] }
 windows = { workspace = true }
 windows-strings = "0.4.2"
 serde_json = "1"
@@ -31,6 +31,7 @@ egui_logger = "0.8.0"
 simplelog = "0.12.2"
 log = "0.4.27"
 scroll = "0.13.0"
+wasmtime = "35.0.0"
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 windows_x86_64_msvc = "0.53"

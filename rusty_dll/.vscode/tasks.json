@@ -1,0 +1,11 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build rusty_dll with WASM shellcode",
+			"type": "shell",
+			"command": "cargo build --release",
+			"group": "build"
+		}
+	]
+}

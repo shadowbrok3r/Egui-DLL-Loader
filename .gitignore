@@ -1,2 +1,4 @@
 /target
 .github/instructions/memory-bank.instructions.md
+dll_loader/src/hollow/wasm_dropper.wat
+rusty_dll/src/wasm_dropper.wat
