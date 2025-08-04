@@ -333,7 +333,7 @@ impl PluginApp {
                                         zero.as_ptr() as _, GUARD_BYTES, None)?;
                         VirtualProtectEx(h_process, (cfg_va + GUARD_OFF) as _, GUARD_BYTES,
                                         old, &mut old)?;
-                    }
+                    
                     
                 }
             }
