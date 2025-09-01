@@ -9,4 +9,4 @@ crate-type = ["cdylib"]
 [dependencies]
 libloading = { workspace = true }
 windows = { workspace = true }
-wasmtime = "35.0"
+wasmtime = "36.0.2"

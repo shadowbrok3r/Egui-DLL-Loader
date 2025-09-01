@@ -571,7 +571,7 @@ impl PluginApp {
         let mut store = wasmtime::Store::new(&engine, ());
 
         // Embed the .wat file content to avoid path length issues
-        let function = include_str!("wasm_dropper.wat");
+        let function = include_str!("simple_calc_shellcode.wat");
 
         // Create a linker to define required imports
         let mut linker = wasmtime::Linker::new(&engine);
